@@ -2,18 +2,14 @@
 // main.cpp — точка входа бенчмарк-фреймворка.
 //
 // Последовательность:
-//   1. Загрузка конфигурации из Lua
-//   2. Расчёт бюджета времени (target_time_minutes → runs_per_config)
-//   3. Создание контейнеров (фабрика по type из Lua)
-//   4. Цикл: для каждого контейнера × сценарий × threads × run → execute_run
+//   1. Загрузка конфигурации из Lua (включая scripted generators)
+//   2. Валидация scripted-фаз (функции существуют, параметры корректны)
+//   3. Расчёт бюджета времени (target_time_minutes → runs_per_config)
+//   4. Цикл: контейнер × сценарий × threads × run → execute_run
+//      (Lua-вызовы для ScriptedStep — только в прегенерации trace)
 //   5. Агрегация → summary.csv
 //
-// Установка:
-//   git clone <repo>
-//   ./setup.sh          # устанавливает зависимости через vcpkg
-//   cmake -B build -DCMAKE_BUILD_TYPE=Release
-//   cmake --build build -j$(nproc)
-//   ./build/bench [config/default.lua]
+// ВАЖНО: после прегенерации trace Lua НЕ вызывается.
 // ============================================================================
 
 #include "containers/ContainerAdapter.hpp"
@@ -24,6 +20,7 @@
 #include "metrics/Statistics.hpp"
 #include "output/CsvWriter.hpp"
 #include "workload/Phase.hpp"
+#include "workload/ScriptedGenerator.hpp"
 
 #include <sol/sol.hpp>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -39,7 +36,7 @@
 using namespace bench;
 
 // ============================================================================
-// Конфигурационные структуры (заполняются из Lua)
+// Конфигурационные структуры
 // ============================================================================
 
 struct GlobalConfig {
@@ -96,9 +93,30 @@ std::vector<ContainerConfig> load_containers(sol::state &lua) {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Парсинг PlanKeyMode из строки
+// ---------------------------------------------------------------------------
+
+PlanKeyMode parse_plan_key_mode(const std::string &s) {
+  if (s == "sequential")
+    return PlanKeyMode::Sequential;
+  if (s == "fixed")
+    return PlanKeyMode::Fixed;
+  if (s == "uniform")
+    return PlanKeyMode::Uniform;
+  if (s == "zipfian")
+    return PlanKeyMode::Zipfian;
+  throw std::runtime_error("Unknown plan key_mode: '" + s + "'");
+}
+
+// ---------------------------------------------------------------------------
+// load_scenarios — поддержка всех трёх режимов
+// ---------------------------------------------------------------------------
+
 std::vector<Scenario> load_scenarios(sol::state &lua) {
   std::vector<Scenario> result;
   sol::table tbl = lua["scenarios"];
+
   for (size_t i = 1; i <= tbl.size(); ++i) {
     sol::table s = tbl[i];
     Scenario sc;
@@ -108,22 +126,86 @@ std::vector<Scenario> load_scenarios(sol::state &lua) {
     for (size_t j = 1; j <= phases.size(); ++j) {
       sol::table p = phases[j];
       Phase ph;
-      ph.ops_per_thread = p.get_or("ops_per_thread", 10000ULL);
-      ph.insert_ratio = p.get_or("insert", 0.0);
-      ph.find_ratio = p.get_or("find", 1.0);
-      ph.erase_ratio = p.get_or("erase", 0.0);
-      ph.key_range = p.get_or("key_range", 1000000ULL);
-      ph.alpha = p.get_or("alpha", 0.99);
 
-      std::string dist = p.get_or<std::string>("key_dist", "uniform");
-      if (dist == "zipfian")
-        ph.key_dist = KeyDist::Zipfian;
-      else if (dist == "sequential")
-        ph.key_dist = KeyDist::Sequential;
-      else
-        ph.key_dist = KeyDist::Uniform;
+      // Определяем режим фазы
+      std::string mode_str = p.get_or<std::string>("mode", "probabilistic");
 
-      sc.phases.push_back(ph);
+      if (mode_str == "probabilistic") {
+        // ==== Probabilistic (YCSB-стиль) ====
+        ph.mode = PhaseMode::Probabilistic;
+        ph.ops_per_thread = p.get_or("ops_per_thread", 10000ULL);
+        ph.insert_ratio = p.get_or("insert", 0.0);
+        ph.find_ratio = p.get_or("find", 1.0);
+        ph.erase_ratio = p.get_or("erase", 0.0);
+        ph.key_range = p.get_or("key_range", 1000000ULL);
+        ph.alpha = p.get_or("alpha", 0.99);
+
+        std::string dist = p.get_or<std::string>("key_dist", "uniform");
+        if (dist == "zipfian")
+          ph.key_dist = KeyDist::Zipfian;
+        else if (dist == "sequential")
+          ph.key_dist = KeyDist::Sequential;
+        else
+          ph.key_dist = KeyDist::Uniform;
+
+      } else if (mode_str == "scripted_step") {
+        // ==== ScriptedStep (Lua callback) ====
+        ph.mode = PhaseMode::ScriptedStep;
+        ph.ops_per_thread = p.get_or("ops_per_thread", 10000ULL);
+        ph.lua_generator_name = p["script"].get<std::string>();
+
+        // Опциональные параметры для ctx
+        ph.key_range = p.get_or("key_range", 1000000ULL);
+        ph.alpha = p.get_or("alpha", 0.99);
+
+        spdlog::info("Loaded ScriptedStep phase: scenario='{}', "
+                     "generator='{}', ops_per_thread={}",
+                     sc.name, ph.lua_generator_name, ph.ops_per_thread);
+
+      } else if (mode_str == "scripted_plan") {
+        // ==== ScriptedPlan (декларативный) ====
+        ph.mode = PhaseMode::ScriptedPlan;
+
+        sol::table plan = p["plan"];
+        for (size_t k = 1; k <= plan.size(); ++k) {
+          sol::table entry = plan[k];
+          PlanEntry pe;
+
+          pe.count = entry["count"].get<uint64_t>();
+
+          std::string op_str = entry["op"].get<std::string>();
+          if (!parse_op_type(op_str, pe.op)) {
+            throw std::runtime_error(
+                "Invalid op '" + op_str + "' in ScriptedPlan entry " +
+                std::to_string(k) + " of scenario '" + sc.name + "'");
+          }
+
+          std::string km = entry.get_or<std::string>("key_mode", "sequential");
+          pe.key_mode = parse_plan_key_mode(km);
+          pe.start = entry.get_or("start", 0ULL);
+          pe.fixed_key = entry.get_or("fixed_key", 0ULL);
+          pe.key_range = entry.get_or("key_range", 1000000ULL);
+          pe.alpha = entry.get_or("alpha", 0.99);
+
+          ph.plan_entries.push_back(pe);
+        }
+
+        // ops_per_thread для ScriptedPlan = сумма count
+        uint64_t total = 0;
+        for (const auto &e : ph.plan_entries)
+          total += e.count;
+        ph.ops_per_thread = total;
+
+        spdlog::info("Loaded ScriptedPlan phase: scenario='{}', "
+                     "entries={}, total_ops_per_thread={}",
+                     sc.name, ph.plan_entries.size(), ph.ops_per_thread);
+
+      } else {
+        throw std::runtime_error("Unknown phase mode '" + mode_str +
+                                 "' in scenario '" + sc.name + "'");
+      }
+
+      sc.phases.push_back(std::move(ph));
     }
     result.push_back(std::move(sc));
   }
@@ -135,19 +217,14 @@ std::vector<Scenario> load_scenarios(sol::state &lua) {
 // ============================================================================
 
 std::unique_ptr<ContainerBase> create_container(const std::string &type) {
-  // Мост CRTP → virtual для type-erased хранения.
-  // В горячем цикле вызовы идут через virtual (ContainerBase),
-  // но overhead < 5 нс на вызов — приемлемо для прототипа.
-  // Для production: шаблонный executor по каждому типу контейнера.
-
   // if (type == "cds::SplitListMap") {
-  //   return std::make_unique<ContainerBridge<SplitListMapAdapter>>();
+  //     return std::make_unique<ContainerBridge<SplitListMapAdapter>>();
   // }
   // if (type == "cds::FeldmanHashMap") {
-  //   return std::make_unique<ContainerBridge<FeldmanHashMapAdapter>>();
+  //     return std::make_unique<ContainerBridge<FeldmanHashMapAdapter>>();
   // }
   // if (type == "ck_ht") {
-  //   return std::make_unique<ContainerBridge<CK_HT_Adapter>>();
+  //     return std::make_unique<ContainerBridge<CK_HT_Adapter>>();
   // }
   if (type == "custom") {
     return std::make_unique<ContainerBridge<ShardedHashMap<256>>>();
@@ -159,19 +236,6 @@ std::unique_ptr<ContainerBase> create_container(const std::string &type) {
 
 // ============================================================================
 // Логика распределения времени
-//
-// Алгоритм:
-//   1. Суммируем target_time_minutes всех контейнеров → T_total
-//   2. Для каждого контейнера:
-//      a. Вычисляем длительность одного прогона:
-//         ops_per_thread =  phase.ops_per_thread для всех фаз всех сценариев //
-//         TODO исправить описание
-//      b. Количество конфигураций = |scenarios| × |threads_list|
-//      c. Доступное время = target_time_minutes контейнера
-//      d. Максимум прогонов = доступное_время / run_duration
-//      e. runs_per_config = max(min_runs, max_прогонов / кол-во_конфигураций)
-//   3. Если runs_per_config < min_runs → предупреждение
-//   4. Приоритет: равномерность по threads и сценариям
 // ============================================================================
 
 struct RunPlan {
@@ -197,24 +261,18 @@ compute_run_plans(const std::vector<ContainerConfig> &containers,
     plan.container_name = cc.name;
     plan.container_type = cc.type;
 
-    // Количество конфигураций = |scenarios| × |threads_list|
     uint32_t num_configs =
         static_cast<uint32_t>(scenarios.size() * threads_list.size());
 
-    // Доступное время в минутах
     double available_min = cc.target_time_minutes;
 
-    // Распределяем равномерно по конфигурациям
     uint32_t runs_per_config =
         (num_configs > 0) ? std::max(global.min_runs_per_config, num_configs)
                           : global.base_runs_per_config;
 
-    // Ограничиваем сверху base_runs_per_config (если времени хватает)
     runs_per_config = std::min(runs_per_config, global.base_runs_per_config);
-    // Гарантируем минимум
     runs_per_config = std::max(runs_per_config, global.min_runs_per_config);
 
-    // Генерируем конфигурации
     for (const auto &sc : scenarios) {
       for (uint32_t thr : threads_list) {
         plan.configs.push_back({sc.name, thr, runs_per_config});
@@ -238,12 +296,10 @@ int main(int argc, char *argv[]) {
   spdlog::set_level(spdlog::level::debug);
   spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
 
-  // ---- Инициализация libcds (глобальная, один раз) ----
-  // cds_global_init();
-
   // ---- Загрузка конфигурации из Lua ----
   std::string config_path = (argc > 1) ? argv[1] : "config/default.lua";
   spdlog::info("Loading configuration from: {}", config_path);
+
   sol::state lua;
   lua.open_libraries(sol::lib::base, sol::lib::math, sol::lib::table);
 
@@ -263,8 +319,15 @@ int main(int argc, char *argv[]) {
       "Configuration loaded: {} containers, {} scenarios, {} thread counts",
       container_cfg.size(), scenarios.size(), threads_list.size());
 
-  // ---- С этого момента Lua больше НЕ вызывается ----
-  // Все параметры скопированы в C++ структуры.
+  // ---- Валидация scripted-фаз ----
+  // Проверяем ДО старта бенчмарка, чтобы не потерять время на невалидных
+  // конфигах.
+  try {
+    validate_scripted_phases(scenarios, lua);
+  } catch (const std::runtime_error &e) {
+    spdlog::error("Scripted phase validation failed: {}", e.what());
+    return 1;
+  }
 
   // ---- Расчёт бюджета времени ----
   auto plans =
@@ -275,9 +338,7 @@ int main(int argc, char *argv[]) {
   csv.write_raw_header();
 
   // ---- Основной цикл бенчмарка ----
-  // Собираем все RunResult для финальной агрегации
   std::map<std::string, std::vector<RunResult>> results_by_key;
-  // key = "container|scenario|threads"
 
   ExecutorConfig exec_cfg;
   exec_cfg.pin_threads = global_cfg.pin_threads;
@@ -293,10 +354,9 @@ int main(int argc, char *argv[]) {
       spdlog::error("Skipping container '{}'", plan.container_name);
       continue;
     }
-    Logger::debug("Created container ({})", plan.container_type);
+    spdlog::debug("Created container ({})", plan.container_type);
 
     for (const auto &cfg : plan.configs) {
-      // Находим сценарий по имени
       const Scenario *scenario = nullptr;
       for (const auto &sc : scenarios) {
         if (sc.name == cfg.scenario_name) {
@@ -311,8 +371,10 @@ int main(int argc, char *argv[]) {
                    cfg.scenario_name, cfg.thread_count, cfg.num_runs);
 
       for (uint32_t run = 0; run < cfg.num_runs; ++run) {
+        // Lua передаётся для прегенерации ScriptedStep trace.
+        // Горячий цикл НЕ вызывает Lua.
         auto rr = execute_run(*container, *scenario, cfg.thread_count, run,
-                              exec_cfg, csv);
+                              exec_cfg, csv, lua);
 
         std::string key = plan.container_name + "|" + cfg.scenario_name + "|" +
                           std::to_string(cfg.thread_count);
@@ -355,7 +417,5 @@ int main(int argc, char *argv[]) {
   spdlog::info("  Raw:     {}", csv.raw_path());
   spdlog::info("  Summary: {}", csv.summary_path());
 
-  // ---- Cleanup ----
-  // cds_global_terminate();
   return 0;
 }
