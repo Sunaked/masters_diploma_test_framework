@@ -203,13 +203,13 @@ scenarios = {
 			{
 				mode = "scripted_plan",
 				plan = {
-					{ count = 100000, op = "insert", key_mode = "sequential", start = 0 },
+					{ count = 1000000, op = "insert", key_mode = "sequential", start = 0 },
 				},
 			},
 			-- Фаза 2: read-heavy probabilistic
 			{
 				mode = "probabilistic",
-				ops_per_thread = 200000,
+				ops_per_thread = 2000000,
 				insert = 0.05,
 				find = 0.90,
 				erase = 0.05,
@@ -220,7 +220,7 @@ scenarios = {
 			-- Фаза 3: scripted cleanup
 			{
 				mode = "scripted_step",
-				ops_per_thread = 50000,
+				ops_per_thread = 500000,
 				script = "alternating_hotspot",
 				key_range = 100000,
 			},

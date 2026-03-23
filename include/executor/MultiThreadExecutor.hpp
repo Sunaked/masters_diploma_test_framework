@@ -4,17 +4,9 @@
 //
 // Архитектура:
 //   1. Предвычисление операций (WorkloadGenerator) — ДО старта замера
-//      Включая Lua-вызовы для ScriptedStep фаз.
-//   2. Барьер (std::barrier) — все потоки стартуют одновременно
-//   3. Горячий цикл: каждый поток итерирует по своему vector<Op>
-//      - Нулевые аллокации, нулевые syscall'ы, нулевой Lua
-//      - Latency: rdtsc до/после каждой операции
-//   4. Барьер — все потоки завершаются
-//   5. Сбор результатов: merge гистограмм, вычисление throughput
-//
-// Ссылки:
-//   [7] Intel SDM Vol. 3B, Ch. 17.17 — "Time-Stamp Counter"
-//   [8] Drepper, "What Every Programmer Should Know About Memory", 2007
+//   2. Дамп trace в CSV (ops/) — для воспроизводимости
+//   3. Барьер → горячий цикл (нулевой Lua, нулевые аллокации) → барьер
+//   4. Сбор результатов
 // ============================================================================
 
 #include "containers/ContainerAdapter.hpp"
@@ -43,7 +35,7 @@
 namespace bench {
 
 // ---------------------------------------------------------------------------
-// rdtsc intrinsic
+// rdtsc
 // ---------------------------------------------------------------------------
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -95,17 +87,13 @@ struct ExecutorConfig {
   bool use_rdtsc = true;
   uint32_t metrics_sampling_ms = 200;
   uint64_t base_seed = 12345;
+  bool dump_ops = true; ///< дампить trace в ops/ директорию
 };
 
 // ---------------------------------------------------------------------------
-// execute_run — один прогон сценария
+// execute_run
 // ---------------------------------------------------------------------------
 
-/// Выполняет один прогон (run) сценария на заданном контейнере.
-///
-/// @param lua  sol::state — передаётся в WorkloadGenerator для ScriptedStep.
-///             Lua вызывается ТОЛЬКО на этапе прегенерации (шаг 1).
-///             Горячий цикл (шаг 3) не трогает Lua.
 inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
                              uint32_t thread_count, uint32_t run_index,
                              const ExecutorConfig &config, CsvWriter &csv,
@@ -114,8 +102,7 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
                 "run_index={}",
                 container.name(), scenario.name, thread_count, run_index);
 
-  // ---- 1. Предвычисление операций (ДО старта замера) ----
-  // Lua-вызовы для ScriptedStep фаз происходят ЗДЕСЬ.
+  // ---- 1. Предвычисление операций ----
   WorkloadConfig wc;
   wc.base_seed = config.base_seed + run_index * 7919;
 
@@ -123,23 +110,25 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
   spdlog::debug("Workload generated: phases={}, thread_count={}",
                 all_ops.size(), thread_count);
 
-  // ---- 2. Очистка контейнера ----
-  spdlog::debug("Container clear begin: run={}, container='{}'", run_index,
-                container.name());
+  // ---- 2. Дамп trace в CSV (только для первого run каждого scenario×threads,
+  //         чтобы не забить диск при 100+ прогонах) ----
+  if (config.dump_ops && run_index == 0) {
+    csv.dump_all_ops(scenario.name, all_ops);
+  }
+
+  // ---- 3. Очистка контейнера ----
   container.clear();
 
-  // ---- 3. Подготовка потоков ----
+  // ---- 4. Подготовка потоков ----
   std::vector<ThreadResult> results(thread_count);
 
-  std::vector<uint64_t> expected_ops_per_thread(thread_count, 0);
   for (uint32_t t = 0; t < thread_count; ++t) {
     uint64_t total = 0;
     for (const auto &phase_ops : all_ops) {
       total += phase_ops[t].size();
     }
-    expected_ops_per_thread[t] = total;
     spdlog::debug("Expected ops: run={}, thread={}, expected_ops={}", run_index,
-                  t, expected_ops_per_thread[t]);
+                  t, total);
     results[t].latencies.resize(total);
     results[t].ops_completed = 0;
   }
@@ -147,11 +136,9 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
   std::barrier sync_start(thread_count + 1);
   std::barrier sync_end(thread_count + 1);
 
-  // ---- 4. Запуск фонового сэмплера ----
   SystemSampler sampler(config.metrics_sampling_ms);
 
-  // ---- 5. Запуск рабочих потоков ----
-  // ГОРЯЧИЙ ЦИКЛ: нулевые аллокации, нулевые Lua-вызовы.
+  // ---- 5. Рабочие потоки (ГОРЯЧИЙ ЦИКЛ) ----
   std::vector<std::thread> workers;
   workers.reserve(thread_count);
 
@@ -166,7 +153,6 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
       auto &res = results[tid];
       sync_start.arrive_and_wait();
 
-      // ---- ГОРЯЧИЙ ЦИКЛ ----
       for (size_t pi = 0; pi < all_ops.size(); ++pi) {
         const auto &ops = all_ops[pi][tid];
 
@@ -204,15 +190,12 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
         throw std::runtime_error("lat_idx != ops_completed: tid=" +
                                  std::to_string(tid));
       }
-
       res.latencies.resize(lat_idx);
       sync_end.arrive_and_wait();
     });
   }
 
   // ---- 6. Старт замера ----
-  spdlog::debug("Sampler start requested: run={}, interval_ms={}", run_index,
-                config.metrics_sampling_ms);
   sampler.start();
   auto wall_start = std::chrono::steady_clock::now();
   sync_start.arrive_and_wait();
@@ -220,24 +203,19 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
   sync_end.arrive_and_wait();
   auto wall_end = std::chrono::steady_clock::now();
   sampler.stop();
-  spdlog::debug("Sampler stopped: run={}, sample_count={}", run_index,
-                sampler.samples().size());
 
   for (auto &w : workers)
     w.join();
 
   for (uint32_t t = 0; t < thread_count; ++t) {
-    spdlog::debug("Post-join thread stats: run={}, tid={}, ops_completed={}, "
-                  "latency_buf_size={}",
-                  run_index, t, results[t].ops_completed,
-                  results[t].latencies.size());
+    spdlog::debug("Post-join: run={}, tid={}, ops={}, lat_buf={}", run_index, t,
+                  results[t].ops_completed, results[t].latencies.size());
   }
 
   // ---- 7. Сбор результатов ----
   double duration_sec =
       std::chrono::duration<double>(wall_end - wall_start).count();
 
-  spdlog::debug("Latency aggregation begin: run={}", run_index);
   uint64_t total_ops = 0;
   std::vector<double> all_latencies;
   for (auto &r : results) {
@@ -247,55 +225,32 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
     }
   }
 
-  spdlog::debug("Aggregating latencies: total_ops={}, total_latency_samples={}",
-                total_ops, all_latencies.size());
   auto lat_stats = compute_stats(all_latencies);
 
-  // Средние системные метрики
   const auto &samples = sampler.samples();
-  if (samples.size() >= 2) {
-    const auto &first = samples.front();
-    const auto &last = samples.back();
-    spdlog::debug("CS delta input: run={}, first(vol={}, invol={}), "
-                  "last(vol={}, invol={}), duration_sec={:.6f}",
-                  run_index, first.voluntary_cs, first.involuntary_cs,
-                  last.voluntary_cs, last.involuntary_cs, duration_sec);
-  }
 
   double avg_cpu = std::numeric_limits<double>::quiet_NaN();
   double avg_rss = std::numeric_limits<double>::quiet_NaN();
   double avg_cs_per_sec = std::numeric_limits<double>::quiet_NaN();
 
   if (!samples.empty()) {
-    double cpu_sum = 0.0;
-    double rss_sum = 0.0;
-
+    double cpu_sum = 0.0, rss_sum = 0.0;
     for (const auto &s : samples) {
       cpu_sum += s.cpu_total_pct;
       rss_sum += static_cast<double>(s.rss_bytes);
     }
-
     avg_cpu = cpu_sum / static_cast<double>(samples.size());
     avg_rss = rss_sum / static_cast<double>(samples.size());
 
     if (samples.size() >= 2 && duration_sec > 0.0) {
       const auto &first = samples.front();
       const auto &last = samples.back();
-      const uint64_t first_cs = first.total_context_switches();
-      const uint64_t last_cs = last.total_context_switches();
-      const uint64_t delta_cs =
-          (last_cs >= first_cs) ? (last_cs - first_cs) : 0ULL;
+      uint64_t first_cs = first.total_context_switches();
+      uint64_t last_cs = last.total_context_switches();
+      uint64_t delta_cs = (last_cs >= first_cs) ? (last_cs - first_cs) : 0ULL;
       avg_cs_per_sec = static_cast<double>(delta_cs) / duration_sec;
-
-      spdlog::debug("CS delta: run={}, first_total={}, last_total={}, "
-                    "delta={}, duration_sec={:.6f}, avg_cs_per_sec={:.3f}",
-                    run_index, first_cs, last_cs, delta_cs, duration_sec,
-                    avg_cs_per_sec);
     }
   }
-
-  spdlog::debug("Latency aggregation done: run={}, total_latency_samples={}",
-                run_index, all_latencies.size());
 
   RunResult rr;
   rr.container_name = container.name();
@@ -317,8 +272,7 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
   csv.write_system_metrics(rr.container_name, rr.scenario_name, rr.thread_count,
                            rr.run_index, samples);
 
-  spdlog::debug("CSV append_raw: run={}, total_ops={}, duration_sec={:.6f}, "
-                "throughput={:.3f}",
+  spdlog::debug("CSV written: run={}, ops={}, dur={:.6f}s, tput={:.3f}",
                 run_index, rr.total_ops, rr.duration_sec, rr.throughput_ops);
   return rr;
 }
