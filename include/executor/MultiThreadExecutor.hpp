@@ -89,6 +89,10 @@ inline void pin_thread_to_core(uint32_t core_id) {
   CPU_ZERO(&cpuset);
   CPU_SET(core_id, &cpuset);
   pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+  int rc = pthread_setaffinity_np(...);
+  if (rc != 0) {
+    spdlog::warn("pthread_setaffinity_np failed for core {}: {}", core_id, rc);
+  }
 #else
   (void)core_id; // no-op on non-Linux
 #endif
