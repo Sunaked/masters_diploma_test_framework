@@ -278,8 +278,6 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
   double avg_cpu = std::numeric_limits<double>::quiet_NaN();
   double avg_rss = std::numeric_limits<double>::quiet_NaN();
   double avg_cs_per_sec = std::numeric_limits<double>::quiet_NaN();
-  spdlog::debug("Computed avg_cs_per_sec: run={}, value={:.6f}", run_index,
-                avg_cs_per_sec);
 
   if (!samples.empty()) {
     double cpu_sum = 0.0;

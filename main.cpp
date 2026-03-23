@@ -293,6 +293,7 @@ int main(int argc, char *argv[]) {
       spdlog::error("Skipping container '{}'", plan.container_name);
       continue;
     }
+    Logger::debug("Created container ({})", plan.container_type);
 
     for (const auto &cfg : plan.configs) {
       // Находим сценарий по имени
