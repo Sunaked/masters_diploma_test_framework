@@ -37,18 +37,15 @@ struct WorkloadConfig {
   /// Консервативная оценка: если контейнер быстрее — поток просто дойдёт
   /// до конца вектора раньше таймаута; если медленнее — фаза завершится
   /// по таймеру, а оставшиеся операции не будут выполнены.
-  uint64_t ops_per_ms_per_thread = 500'000;
 
   /// Базовый seed для ГПСЧ. Поток i получит seed = base_seed + i.
   uint64_t base_seed = 12345;
 };
 
 /// Генерирует предвычисленный набор операций для одного потока и одной фазы.
-inline std::vector<Op> generate_phase_ops(const Phase &phase,
-                                          uint64_t thread_id,
-                                          uint64_t ops_per_ms_per_thread,
-                                          uint64_t base_seed) {
-  const uint64_t total_ops = phase.duration_ms * ops_per_ms_per_thread;
+inline std::vector<Op>
+generate_phase_ops(const Phase &phase, uint64_t thread_id, uint64_t base_seed) {
+  const uint64_t total_ops = phase.ops_per_thread;
   std::vector<Op> ops;
   ops.reserve(total_ops);
 
@@ -115,19 +112,15 @@ generate_scenario_ops(const Scenario &scenario, uint32_t thread_count,
                       const WorkloadConfig &config = {}) {
   std::vector<std::vector<std::vector<Op>>> all_ops;
 
-  spdlog::info("Workload generator: ops_per_ms_per_thread={}",
-               config.ops_per_ms_per_thread);
   all_ops.reserve(scenario.phases.size());
 
   for (size_t pi = 0; pi < scenario.phases.size(); ++pi) {
     const auto &phase = scenario.phases[pi];
     std::vector<std::vector<Op>> phase_ops(thread_count);
-
     for (uint32_t tid = 0; tid < thread_count; ++tid) {
       // Уникальный seed для каждой (фаза, поток) комбинации
       uint64_t phase_seed = config.base_seed + pi * 1'000'000 + tid;
-      phase_ops[tid] = generate_phase_ops(
-          phase, tid, config.ops_per_ms_per_thread, phase_seed);
+      phase_ops[tid] = generate_phase_ops(phase, tid, phase_seed);
     }
 
     all_ops.push_back(std::move(phase_ops));

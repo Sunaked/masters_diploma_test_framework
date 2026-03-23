@@ -20,11 +20,15 @@
 // ============================================================================
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
+#include <spdlog/spdlog.h>
 #include <sstream>
 #include <string>
+#include <sys/resource.h>
 #include <thread>
 #include <vector>
 
@@ -32,174 +36,213 @@ namespace bench {
 
 /// Одна выборка системных метрик.
 struct SystemSample {
-    uint64_t timestamp_us     = 0;   ///< микросекунды с начала прогона
-    double   cpu_total_pct    = 0.0; ///< суммарная CPU utilization [0..100]
-    uint64_t rss_bytes        = 0;   ///< Resident Set Size
-    uint64_t voluntary_cs     = 0;   ///< voluntary context switches
-    uint64_t involuntary_cs   = 0;   ///< involuntary context switches
-    uint64_t page_faults      = 0;   ///< minor page faults
-    uint64_t llc_misses       = 0;   ///< LLC cache misses (0 если недоступно)
+  uint64_t timestamp_us = 0;   ///< микросекунды с начала прогона
+  double cpu_total_pct = 0.0;  ///< суммарная CPU utilization [0..100]
+  uint64_t rss_bytes = 0;      ///< Resident Set Size
+  uint64_t voluntary_cs = 0;   ///< voluntary context switches
+  uint64_t involuntary_cs = 0; ///< involuntary context switches
+  uint64_t page_faults = 0;    ///< minor page faults
+  uint64_t llc_misses = 0;     ///< LLC cache misses (0 если недоступно)
+  uint64_t total_context_switches() const noexcept {
+    return voluntary_cs + involuntary_cs;
+  }
 };
 
 /// Фоновый сэмплер системных метрик.
 class SystemSampler {
 public:
-    explicit SystemSampler(uint32_t sampling_ms = 200)
-        : sampling_interval_ms_(sampling_ms) {}
+  explicit SystemSampler(uint32_t sampling_ms = 200)
+      : sampling_interval_ms_(sampling_ms) {}
 
-    /// Запускает фоновый поток сбора метрик.
-    void start() {
-        running_.store(true, std::memory_order_release);
-        start_time_ = std::chrono::steady_clock::now();
-        thread_ = std::thread([this] { sample_loop(); });
+  /// Запускает фоновый поток сбора метрик.
+  void start() {
+    spdlog::debug("SystemSampler start: interval_ms={}", sampling_interval_ms_);
+    running_.store(true, std::memory_order_release);
+    start_time_ = std::chrono::steady_clock::now();
+    thread_ = std::thread([this] { sample_loop(); });
 
-        // Опционально: привязать поток сэмплера к последнему ядру
-        // чтобы не конкурировать с рабочими потоками
-        // TODO: sched_setaffinity для потока сэмплера
+    // Опционально: привязать поток сэмплера к последнему ядру
+    // чтобы не конкурировать с рабочими потоками
+    // TODO: sched_setaffinity для потока сэмплера
+  }
+
+  /// Останавливает сбор метрик.
+  void stop() {
+    spdlog::debug("SystemSampler stop requested");
+    running_.store(false, std::memory_order_release);
+    if (thread_.joinable()) {
+      thread_.join();
+      spdlog::debug("SystemSampler stopped: samples_collected={}",
+                    samples_.size());
     }
+  }
 
-    /// Останавливает сбор метрик.
-    void stop() {
-        running_.store(false, std::memory_order_release);
-        if (thread_.joinable()) {
-            thread_.join();
-        }
-    }
+  /// Возвращает собранные выборки (вызывать после stop()).
+  const std::vector<SystemSample> &samples() const { return samples_; }
 
-    /// Возвращает собранные выборки (вызывать после stop()).
-    const std::vector<SystemSample>& samples() const { return samples_; }
-
-    ~SystemSampler() { stop(); }
+  ~SystemSampler() { stop(); }
 
 private:
-    uint32_t sampling_interval_ms_;
-    std::atomic<bool> running_{false};
-    std::thread thread_;
-    std::vector<SystemSample> samples_;
-    std::chrono::steady_clock::time_point start_time_;
+  uint32_t sampling_interval_ms_;
+  std::atomic<bool> running_{false};
+  std::thread thread_;
+  std::vector<SystemSample> samples_;
+  std::chrono::steady_clock::time_point start_time_;
 
-    // Предыдущие значения /proc/stat для вычисления delta
-    uint64_t prev_total_jiffies_ = 0;
-    uint64_t prev_idle_jiffies_  = 0;
+  // Предыдущие значения /proc/stat для вычисления delta
+  uint64_t prev_total_jiffies_ = 0;
+  uint64_t prev_idle_jiffies_ = 0;
 
-    void sample_loop() {
-        samples_.reserve(4096); // pre-allocate чтобы избежать realloc
+  void sample_loop() {
+    samples_.reserve(4096); // pre-allocate чтобы избежать realloc
+    spdlog::debug("SystemSampler loop begin");
 
-        while (running_.load(std::memory_order_acquire)) {
-            SystemSample s;
+    while (running_.load(std::memory_order_acquire)) {
+      SystemSample s;
 
-            auto now = std::chrono::steady_clock::now();
-            s.timestamp_us = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    now - start_time_).count());
+      auto now = std::chrono::steady_clock::now();
+      s.timestamp_us = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(now -
+                                                                start_time_)
+              .count());
 
-            read_cpu_utilization(s);
-            read_memory_info(s);
-            read_context_switches(s);
-            read_page_faults(s);
-            read_llc_misses(s);
+      read_cpu_utilization(s);
+      read_memory_info(s);
+      read_context_switches(s);
+      read_page_faults(s);
+      read_llc_misses(s);
 
-            samples_.push_back(s);
+      samples_.push_back(s);
+      spdlog::debug(
+          "System sample: ts_us={}, cpu_total_pct={:.3f}, rss_bytes={}, "
+          "voluntary_cs={}, involuntary_cs={}, page_faults={}, llc_misses={}",
+          s.timestamp_us, s.cpu_total_pct, s.rss_bytes, s.voluntary_cs,
+          s.involuntary_cs, s.page_faults, s.llc_misses);
 
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(sampling_interval_ms_));
-        }
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(sampling_interval_ms_));
+    }
+    spdlog::debug("SystemSampler loop end");
+  }
+
+  /// Читает /proc/stat для CPU utilization.
+  void read_cpu_utilization(SystemSample &s) {
+    std::ifstream f("/proc/stat");
+    if (!f.is_open()) {
+      spdlog::debug("Failed to open /proc/stat");
+      return;
     }
 
-    /// Читает /proc/stat для CPU utilization.
-    void read_cpu_utilization(SystemSample& s) {
-        std::ifstream f("/proc/stat");
-        if (!f.is_open()) return;
+    std::string line;
+    std::getline(f, line); // первая строка: "cpu ..."
 
-        std::string line;
-        std::getline(f, line); // первая строка: "cpu ..."
+    // Парсим: cpu user nice system idle iowait irq softirq steal guest
+    // guest_nice
+    std::istringstream iss(line);
+    std::string cpu_label;
+    uint64_t user, nice, system, idle, iowait, irq, softirq, steal;
+    iss >> cpu_label >> user >> nice >> system >> idle >> iowait >> irq >>
+        softirq >> steal;
 
-        // Парсим: cpu user nice system idle iowait irq softirq steal guest guest_nice
-        std::istringstream iss(line);
-        std::string cpu_label;
-        uint64_t user, nice, system, idle, iowait, irq, softirq, steal;
-        iss >> cpu_label >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal;
+    uint64_t total =
+        user + nice + system + idle + iowait + irq + softirq + steal;
+    uint64_t idle_total = idle + iowait;
 
-        uint64_t total = user + nice + system + idle + iowait + irq + softirq + steal;
-        uint64_t idle_total = idle + iowait;
-
-        if (prev_total_jiffies_ > 0) {
-            uint64_t d_total = total - prev_total_jiffies_;
-            uint64_t d_idle  = idle_total - prev_idle_jiffies_;
-            if (d_total > 0) {
-                s.cpu_total_pct = 100.0 * (1.0 - static_cast<double>(d_idle) / d_total);
-            }
-        }
-
-        prev_total_jiffies_ = total;
-        prev_idle_jiffies_  = idle_total;
+    if (prev_total_jiffies_ > 0) {
+      uint64_t d_total = total - prev_total_jiffies_;
+      uint64_t d_idle = idle_total - prev_idle_jiffies_;
+      if (d_total > 0) {
+        s.cpu_total_pct = 100.0 * (1.0 - static_cast<double>(d_idle) / d_total);
+      }
     }
 
-    /// Читает RSS из /proc/self/status.
-    void read_memory_info(SystemSample& s) {
-        std::ifstream f("/proc/self/status");
-        if (!f.is_open()) return;
+    prev_total_jiffies_ = total;
+    prev_idle_jiffies_ = idle_total;
+    spdlog::debug("CPU util sample: total_jiffies={}, idle_jiffies={}, "
+                  "prev_total={}, prev_idle={}, cpu_total_pct={:.3f}",
+                  total, idle_total, prev_total_jiffies_, prev_idle_jiffies_,
+                  s.cpu_total_pct);
+  }
 
-        std::string line;
-        while (std::getline(f, line)) {
-            if (line.compare(0, 6, "VmRSS:") == 0) {
-                uint64_t kb = 0;
-                std::sscanf(line.c_str(), "VmRSS: %lu kB", &kb);
-                s.rss_bytes = kb * 1024;
-                break;
-            }
-        }
+  /// Читает RSS из /proc/self/status.
+  void read_memory_info(SystemSample &s) {
+    std::ifstream f("/proc/self/status");
+    if (!f.is_open()) {
+      spdlog::debug("VmRSS not found in /proc/self/status");
+      return;
     }
 
-    /// Читает context switches из /proc/self/status.
-    void read_context_switches(SystemSample& s) {
-        std::ifstream f("/proc/self/status");
-        if (!f.is_open()) return;
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.compare(0, 6, "VmRSS:") == 0) {
+        uint64_t kb = 0;
+        std::sscanf(line.c_str(), "VmRSS: %lu kB", &kb);
+        s.rss_bytes = kb * 1024;
+        break;
+      }
+    }
+    spdlog::debug("Memory sample: rss_bytes={}", s.rss_bytes);
+  }
 
-        std::string line;
-        while (std::getline(f, line)) {
-            if (line.compare(0, 25, "voluntary_ctxt_switches:") == 0) {
-                std::sscanf(line.c_str(), "voluntary_ctxt_switches: %lu", &s.voluntary_cs);
-            } else if (line.compare(0, 27, "nonvoluntary_ctxt_switches:") == 0) {
-                std::sscanf(line.c_str(), "nonvoluntary_ctxt_switches: %lu", &s.involuntary_cs);
-            }
-        }
+  /// Читает context switches из getrusage. link:
+  /// https://man7.org/linux/man-pages/man2/getrusage.2.html?utm_source=chatgpt.com
+  void read_context_switches(SystemSample &s) {
+    struct rusage ru{};
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+      spdlog::debug("getrusage failed: errno={}, msg={}", errno,
+                    std::strerror(errno));
+      return;
     }
 
-    /// Читает page faults из /proc/self/stat (поле 10 — minflt).
-    void read_page_faults(SystemSample& s) {
-        std::ifstream f("/proc/self/stat");
-        if (!f.is_open()) return;
+    s.voluntary_cs = static_cast<uint64_t>(ru.ru_nvcsw);
+    s.involuntary_cs = static_cast<uint64_t>(ru.ru_nivcsw);
 
-        std::string content;
-        std::getline(f, content);
+    spdlog::debug("Context switches sample: voluntary_cs={}, involuntary_cs={}",
+                  s.voluntary_cs, s.involuntary_cs);
+  }
 
-        // Поле 10 (0-indexed: 9) — minflt (minor page faults)
-        // Формат: pid (comm) state ppid ... minflt cminflt majflt ...
-        // Ищем закрывающую скобку comm, затем парсим поля
-        auto pos = content.rfind(')');
-        if (pos == std::string::npos) return;
-
-        std::istringstream iss(content.substr(pos + 2));
-        std::string token;
-        // Поля после (comm): state(1) ppid(2) pgrp(3) session(4) tty(5) tpgid(6)
-        // flags(7) minflt(8) cminflt(9) majflt(10)
-        for (int i = 0; i < 8; ++i) iss >> token; // пропускаем до minflt
-        iss >> s.page_faults;
+  /// Читает page faults из /proc/self/stat (поле 10 — minflt).
+  void read_page_faults(SystemSample &s) {
+    std::ifstream f("/proc/self/stat");
+    if (!f.is_open()) {
+      spdlog::debug("Failed to parse /proc/self/stat for page_faults");
+      return;
     }
 
-    /// LLC cache misses через perf_event_open.
-    /// TODO: полная реализация с perf_event_open(2) для PERF_COUNT_HW_CACHE_MISSES.
-    void read_llc_misses(SystemSample& s) {
-        // Заглушка: perf_event_open требует CAP_PERFMON или perf_event_paranoid ≤ 1.
-        // Полная реализация:
-        //   1. Открыть fd = perf_event_open({type=PERF_TYPE_HARDWARE,
-        //      config=PERF_COUNT_HW_CACHE_MISSES}, pid=0, cpu=-1, group=-1, 0)
-        //   2. ioctl(fd, PERF_EVENT_IOC_ENABLE)
-        //   3. read(fd, &count, sizeof(count))
-        // Если CAP_PERFMON недоступен — s.llc_misses остаётся 0.
-        s.llc_misses = 0;
-    }
+    std::string content;
+    std::getline(f, content);
+
+    // Поле 10 (0-indexed: 9) — minflt (minor page faults)
+    // Формат: pid (comm) state ppid ... minflt cminflt majflt ...
+    // Ищем закрывающую скобку comm, затем парсим поля
+    auto pos = content.rfind(')');
+    if (pos == std::string::npos)
+      return;
+
+    std::istringstream iss(content.substr(pos + 2));
+    std::string token;
+    // Поля после (comm): state(1) ppid(2) pgrp(3) session(4) tty(5) tpgid(6)
+    // flags(7) minflt(8) cminflt(9) majflt(10)
+    for (int i = 0; i < 8; ++i)
+      iss >> token; // пропускаем до minflt
+    iss >> s.page_faults;
+    spdlog::debug("Page faults sample: page_faults={}", s.page_faults);
+  }
+
+  /// LLC cache misses через perf_event_open.
+  /// TODO: полная реализация с perf_event_open(2) для
+  /// PERF_COUNT_HW_CACHE_MISSES.
+  void read_llc_misses(SystemSample &s) {
+    spdlog::debug("LLC misses unavailable: using stub value 0");
+    // Заглушка: perf_event_open требует CAP_PERFMON или perf_event_paranoid
+    // ≤ 1. Полная реализация:
+    //   1. Открыть fd = perf_event_open({type=PERF_TYPE_HARDWARE,
+    //      config=PERF_COUNT_HW_CACHE_MISSES}, pid=0, cpu=-1, group=-1, 0)
+    //   2. ioctl(fd, PERF_EVENT_IOC_ENABLE)
+    //   3. read(fd, &count, sizeof(count))
+    // Если CAP_PERFMON недоступен — s.llc_misses остаётся 0.
+    s.llc_misses = 0;
+  }
 };
 
 } // namespace bench

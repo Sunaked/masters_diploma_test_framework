@@ -49,7 +49,6 @@ struct GlobalConfig {
   uint32_t metrics_sampling_ms = 200;
   bool pin_threads = true;
   bool use_rdtsc_for_latency = true;
-  uint64_t ops_per_ms_per_thread = 500;
 };
 
 struct ContainerConfig {
@@ -71,7 +70,6 @@ GlobalConfig load_global(sol::state &lua) {
   g.metrics_sampling_ms = tbl.get_or("metrics_sampling_ms", 200u);
   g.pin_threads = tbl.get_or("pin_threads", true);
   g.use_rdtsc_for_latency = tbl.get_or("use_rdtsc_for_latency", true);
-  g.ops_per_ms_per_thread = tbl.get_or("ops_per_ms_per_thread", 500);
   return g;
 }
 
@@ -110,7 +108,7 @@ std::vector<Scenario> load_scenarios(sol::state &lua) {
     for (size_t j = 1; j <= phases.size(); ++j) {
       sol::table p = phases[j];
       Phase ph;
-      ph.duration_ms = p.get_or("duration_ms", 10000ULL);
+      ph.ops_per_thread = p.get_or("ops_per_thread", 10000ULL);
       ph.insert_ratio = p.get_or("insert", 0.0);
       ph.find_ratio = p.get_or("find", 1.0);
       ph.erase_ratio = p.get_or("erase", 0.0);
@@ -166,7 +164,8 @@ std::unique_ptr<ContainerBase> create_container(const std::string &type) {
 //   1. Суммируем target_time_minutes всех контейнеров → T_total
 //   2. Для каждого контейнера:
 //      a. Вычисляем длительность одного прогона:
-//         run_duration = Σ phase.duration_ms для всех фаз всех сценариев
+//         ops_per_thread =  phase.ops_per_thread для всех фаз всех сценариев //
+//         TODO исправить описание
 //      b. Количество конфигураций = |scenarios| × |threads_list|
 //      c. Доступное время = target_time_minutes контейнера
 //      d. Максимум прогонов = доступное_время / run_duration
@@ -198,20 +197,6 @@ compute_run_plans(const std::vector<ContainerConfig> &containers,
     plan.container_name = cc.name;
     plan.container_type = cc.type;
 
-    // Длительность одного полного прогона (один сценарий, все фазы)
-    // в минутах. Берём максимум среди сценариев для оценки.
-    double max_scenario_duration_min = 0.0;
-    double total_scenario_duration_min = 0.0;
-    for (const auto &sc : scenarios) {
-      double dur_ms = 0.0;
-      for (const auto &ph : sc.phases) {
-        dur_ms += static_cast<double>(ph.duration_ms);
-      }
-      double dur_min = dur_ms / 60000.0;
-      max_scenario_duration_min = std::max(max_scenario_duration_min, dur_min);
-      total_scenario_duration_min += dur_min;
-    }
-
     // Количество конфигураций = |scenarios| × |threads_list|
     uint32_t num_configs =
         static_cast<uint32_t>(scenarios.size() * threads_list.size());
@@ -219,40 +204,15 @@ compute_run_plans(const std::vector<ContainerConfig> &containers,
     // Доступное время в минутах
     double available_min = cc.target_time_minutes;
 
-    // Максимальное количество прогонов (общее)
-    // Один прогон = один сценарий × один threads_count
-    // Средняя длительность прогона ≈ total_scenario_duration / |scenarios|
-    double avg_run_min = total_scenario_duration_min / scenarios.size();
-    if (avg_run_min <= 0)
-      avg_run_min = 0.5; // fallback: 30 сек
-
-    uint32_t max_total_runs =
-        static_cast<uint32_t>(available_min / avg_run_min);
-
     // Распределяем равномерно по конфигурациям
     uint32_t runs_per_config =
-        (num_configs > 0)
-            ? std::max(global.min_runs_per_config, max_total_runs / num_configs)
-            : global.base_runs_per_config;
+        (num_configs > 0) ? std::max(global.min_runs_per_config, num_configs)
+                          : global.base_runs_per_config;
 
     // Ограничиваем сверху base_runs_per_config (если времени хватает)
     runs_per_config = std::min(runs_per_config, global.base_runs_per_config);
     // Гарантируем минимум
     runs_per_config = std::max(runs_per_config, global.min_runs_per_config);
-
-    // Проверка: хватит ли времени для min_runs × all configs
-    double estimated_total_min = runs_per_config * num_configs * avg_run_min;
-    if (estimated_total_min > available_min * 1.2) {
-      spdlog::warn("Container '{}': estimated time {:.1f} min exceeds budget "
-                   "{:.1f} min. "
-                   "Reducing runs to fit.",
-                   cc.name, estimated_total_min, available_min);
-      // Принудительно уменьшаем, сохраняя минимум
-      while (runs_per_config > global.min_runs_per_config &&
-             runs_per_config * num_configs * avg_run_min > available_min) {
-        --runs_per_config;
-      }
-    }
 
     // Генерируем конфигурации
     for (const auto &sc : scenarios) {
@@ -260,12 +220,6 @@ compute_run_plans(const std::vector<ContainerConfig> &containers,
         plan.configs.push_back({sc.name, thr, runs_per_config});
       }
     }
-
-    spdlog::info("Container '{}': {} configs × {} runs = {} total runs "
-                 "(budget: {:.1f} min, est: {:.1f} min)",
-                 cc.name, num_configs, runs_per_config,
-                 num_configs * runs_per_config, available_min,
-                 runs_per_config * num_configs * avg_run_min);
 
     plans.push_back(std::move(plan));
   }
@@ -281,7 +235,7 @@ int main(int argc, char *argv[]) {
   // ---- Логирование ----
   auto console = spdlog::stdout_color_mt("bench");
   spdlog::set_default_logger(console);
-  spdlog::set_level(spdlog::level::info);
+  spdlog::set_level(spdlog::level::debug);
   spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
 
   // ---- Инициализация libcds (глобальная, один раз) ----
@@ -290,7 +244,6 @@ int main(int argc, char *argv[]) {
   // ---- Загрузка конфигурации из Lua ----
   std::string config_path = (argc > 1) ? argv[1] : "config/default.lua";
   spdlog::info("Loading configuration from: {}", config_path);
-
   sol::state lua;
   lua.open_libraries(sol::lib::base, sol::lib::math, sol::lib::table);
 
@@ -330,7 +283,6 @@ int main(int argc, char *argv[]) {
   exec_cfg.pin_threads = global_cfg.pin_threads;
   exec_cfg.use_rdtsc = global_cfg.use_rdtsc_for_latency;
   exec_cfg.metrics_sampling_ms = global_cfg.metrics_sampling_ms;
-  exec_cfg.ops_per_ms_per_thread = global_cfg.ops_per_ms_per_thread;
 
   for (const auto &plan : plans) {
     spdlog::info("=== Container: {} (type: {}) ===", plan.container_name,

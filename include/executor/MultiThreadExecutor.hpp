@@ -88,8 +88,7 @@ inline void pin_thread_to_core(uint32_t core_id) {
   cpu_set_t cpuset;
   CPU_ZERO(&cpuset);
   CPU_SET(core_id, &cpuset);
-  pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-  int rc = pthread_setaffinity_np(...);
+  int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
   if (rc != 0) {
     spdlog::warn("pthread_setaffinity_np failed for core {}: {}", core_id, rc);
   }
@@ -107,7 +106,6 @@ struct ExecutorConfig {
   bool pin_threads = true;
   bool use_rdtsc = true;
   uint32_t metrics_sampling_ms = 200;
-  uint64_t ops_per_ms_per_thread = 500'000;
   uint64_t base_seed = 12345;
 };
 
@@ -118,29 +116,39 @@ struct ExecutorConfig {
 inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
                              uint32_t thread_count, uint32_t run_index,
                              const ExecutorConfig &config, CsvWriter &csv) {
-  spdlog::info("  Run {}: {} threads, scenario '{}'", run_index, thread_count,
-               scenario.name);
+  spdlog::debug("execute_run begin: container='{}', scenario='{}', threads={}, "
+                "run_index={}",
+                container.name(), scenario.name, thread_count, run_index);
 
   // ---- 1. Предвычисление операций (ДО старта замера) ----
   WorkloadConfig wc;
-  wc.ops_per_ms_per_thread = config.ops_per_ms_per_thread;
   wc.base_seed = config.base_seed + run_index * 7919;
 
   auto all_ops = generate_scenario_ops(scenario, thread_count, wc);
+  spdlog::debug("Workload generated: phases={}, thread_count={}",
+                all_ops.size(), thread_count);
 
   // ---- 2. Очистка контейнера ----
+  spdlog::debug("Container clear begin: run={}, container='{}'", run_index,
+                container.name());
   container.clear();
 
   // ---- 3. Подготовка потоков ----
   std::vector<ThreadResult> results(thread_count);
 
   // Резервируем память для latencies ДО старта
+  std::vector<uint64_t> expected_ops_per_thread(thread_count, 0);
+
   for (uint32_t t = 0; t < thread_count; ++t) {
     uint64_t total = 0;
-    for (auto &phase_ops : all_ops) {
+    for (const auto &phase_ops : all_ops) {
       total += phase_ops[t].size();
     }
-    results[t].latencies.reserve(total);
+    expected_ops_per_thread[t] = total;
+    spdlog::debug("Expected ops: run={}, thread={}, expected_ops={}", run_index,
+                  t, expected_ops_per_thread[t]);
+    results[t].latencies.resize(total);
+    results[t].ops_completed = 0;
   }
 
   // Барьер: все потоки стартуют одновременно
@@ -156,6 +164,7 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
 
   for (uint32_t tid = 0; tid < thread_count; ++tid) {
     workers.emplace_back([&, tid] {
+      size_t lat_idx = 0;
       // Thread pinning
       if (config.pin_threads) {
         pin_thread_to_core(tid);
@@ -172,23 +181,14 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
       // Нулевые аллокации, нулевые syscall'ы, нулевой Lua
       for (size_t pi = 0; pi < all_ops.size(); ++pi) {
         const auto &ops = all_ops[pi][tid];
-        const auto phase_deadline =
-            std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(scenario.phases[pi].duration_ms);
 
         for (size_t i = 0; i < ops.size(); ++i) {
-          // Проверяем дедлайн каждые 1024 операции (amortised)
-          if ((i & 0x3FF) == 0) {
-            if (std::chrono::steady_clock::now() >= phase_deadline)
-              break;
-          }
-
           const auto &op = ops[i];
           uint64_t t0 = rdtsc();
 
           switch (op.type) {
           case OpType::Insert:
-            container.insert(op.key, op.key); // value = key
+            container.insert(op.key, op.key);
             break;
           case OpType::Find: {
             uint64_t val;
@@ -201,16 +201,30 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
           }
 
           uint64_t t1 = rdtsc();
-          res.latencies.push_back(t1 - t0);
+          if (lat_idx >= res.latencies.size()) {
+            throw std::runtime_error(
+                "latency buffer overflow: tid=" + std::to_string(tid) +
+                ", lat_idx=" + std::to_string(lat_idx) +
+                ", size=" + std::to_string(res.latencies.size()));
+          }
+
+          res.latencies[lat_idx++] = t1 - t0;
           ++res.ops_completed;
         }
       }
+      if (lat_idx != res.ops_completed) {
+        throw std::runtime_error("lat_idx != ops_completed: tid=" +
+                                 std::to_string(tid));
+      }
 
+      res.latencies.resize(lat_idx);
       sync_end.arrive_and_wait(); // сигнализируем о завершении
     });
   }
 
   // ---- 6. Старт замера ----
+  spdlog::debug("Sampler start requested: run={}, interval_ms={}", run_index,
+                config.metrics_sampling_ms);
   sampler.start();
   auto wall_start = std::chrono::steady_clock::now();
   sync_start.arrive_and_wait(); // отпускаем потоки
@@ -219,14 +233,23 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
   sync_end.arrive_and_wait();
   auto wall_end = std::chrono::steady_clock::now();
   sampler.stop();
+  spdlog::debug("Sampler stopped: run={}, sample_count={}", run_index,
+                sampler.samples().size());
 
   for (auto &w : workers)
     w.join();
 
+  for (uint32_t t = 0; t < thread_count; ++t) {
+    spdlog::debug("Post-join thread stats: run={}, tid={}, ops_completed={}, "
+                  "latency_buf_size={}",
+                  run_index, t, results[t].ops_completed,
+                  results[t].latencies.size());
+  }
   // ---- 7. Сбор результатов ----
   double duration_sec =
       std::chrono::duration<double>(wall_end - wall_start).count();
 
+  spdlog::debug("Latency aggregation begin: run={}", run_index);
   uint64_t total_ops = 0;
   std::vector<double> all_latencies;
   for (auto &r : results) {
@@ -236,20 +259,63 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
     }
   }
 
+  spdlog::debug("Aggregating latencies: total_ops={}, total_latency_samples={}",
+                total_ops, all_latencies.size());
   auto lat_stats = compute_stats(all_latencies);
 
   // Средние системные метрики
-  double avg_cpu = 0.0, avg_rss = 0.0;
-  const auto &samples = sampler.samples();
-  if (!samples.empty()) {
-    for (const auto &s : samples) {
-      avg_cpu += s.cpu_total_pct;
-      avg_rss += static_cast<double>(s.rss_bytes);
-    }
-    avg_cpu /= samples.size();
-    avg_rss /= samples.size();
-  }
 
+  const auto &samples = sampler.samples();
+  if (samples.size() >= 2) {
+    const auto &first = samples.front();
+    const auto &last = samples.back();
+
+    spdlog::debug("CS delta input: run={}, first(vol={}, invol={}), "
+                  "last(vol={}, invol={}), duration_sec={:.6f}",
+                  run_index, first.voluntary_cs, first.involuntary_cs,
+                  last.voluntary_cs, last.involuntary_cs, duration_sec);
+  }
+  double avg_cpu = std::numeric_limits<double>::quiet_NaN();
+  double avg_rss = std::numeric_limits<double>::quiet_NaN();
+  double avg_cs_per_sec = std::numeric_limits<double>::quiet_NaN();
+  spdlog::debug("Computed avg_cs_per_sec: run={}, value={:.6f}", run_index,
+                avg_cs_per_sec);
+
+  if (!samples.empty()) {
+    double cpu_sum = 0.0;
+    double rss_sum = 0.0;
+
+    for (const auto &s : samples) {
+      cpu_sum += s.cpu_total_pct;
+      rss_sum += static_cast<double>(s.rss_bytes);
+    }
+
+    avg_cpu = cpu_sum / static_cast<double>(samples.size());
+    avg_rss = rss_sum / static_cast<double>(samples.size());
+
+    if (samples.size() >= 2 && duration_sec > 0.0) {
+      const auto &first = samples.front();
+      const auto &last = samples.back();
+
+      const uint64_t first_cs = first.total_context_switches();
+      const uint64_t last_cs = last.total_context_switches();
+      const uint64_t delta_cs =
+          (last_cs >= first_cs) ? (last_cs - first_cs) : 0ULL;
+
+      avg_cs_per_sec = static_cast<double>(delta_cs) / duration_sec;
+
+      spdlog::debug("CS delta: run={}, first_total={}, last_total={}, "
+                    "delta={}, duration_sec={:.6f}, avg_cs_per_sec={:.3f}",
+                    run_index, first_cs, last_cs, delta_cs, duration_sec,
+                    avg_cs_per_sec);
+    } else {
+      spdlog::debug(
+          "CS metrics invalid: run={}, samples={}, duration_sec={:.6f}",
+          run_index, samples.size(), duration_sec);
+    }
+  }
+  spdlog::debug("Latency aggregation done: run={}, total_latency_samples={}",
+                run_index, all_latencies.size());
   RunResult rr;
   rr.container_name = container.name();
   rr.scenario_name = scenario.name;
@@ -264,15 +330,16 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
   rr.lat_p999 = lat_stats.p999;
   rr.avg_cpu_pct = avg_cpu;
   rr.avg_rss_mb = avg_rss / (1024.0 * 1024.0);
+  rr.avg_cs_per_sec = avg_cs_per_sec;
 
   // Записываем в CSV
   csv.append_raw(rr);
   csv.write_system_metrics(rr.container_name, rr.scenario_name, rr.thread_count,
                            rr.run_index, samples);
 
-  spdlog::info("    → {} ops in {:.2f}s = {:.0f} ops/sec, p99={:.0f}",
-               total_ops, duration_sec, rr.throughput_ops, rr.lat_p99);
-
+  spdlog::debug("CSV append_raw: run={}, total_ops={}, duration_sec={:.6f}, "
+                "throughput={:.3f}",
+                run_index, rr.total_ops, rr.duration_sec, rr.throughput_ops);
   return rr;
 }
 
