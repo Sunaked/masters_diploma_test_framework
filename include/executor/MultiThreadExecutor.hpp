@@ -235,13 +235,29 @@ inline RunResult execute_run(const std::string &container_name,
   double avg_cs_per_sec = std::numeric_limits<double>::quiet_NaN();
 
   if (!samples.empty()) {
-    double cpu_sum = 0.0, rss_sum = 0.0;
+    double rss_sum = 0.0;
     for (const auto &s : samples) {
-      cpu_sum += s.cpu_total_pct;
       rss_sum += static_cast<double>(s.rss_bytes);
     }
-    avg_cpu = cpu_sum / static_cast<double>(samples.size());
     avg_rss = rss_sum / static_cast<double>(samples.size());
+
+    // CPU: первую baseline sample не учитываем, если есть хотя бы 2 sample
+    size_t cpu_begin = 0;
+    if (samples.size() >= 2) {
+      cpu_begin = 1;
+    }
+
+    if (cpu_begin < samples.size()) {
+      double cpu_sum = 0.0;
+      size_t cpu_count = 0;
+      for (size_t i = cpu_begin; i < samples.size(); ++i) {
+        cpu_sum += samples[i].cpu_total_pct;
+        ++cpu_count;
+      }
+      if (cpu_count > 0) {
+        avg_cpu = cpu_sum / static_cast<double>(cpu_count);
+      }
+    }
 
     if (samples.size() >= 2 && duration_sec > 0.0) {
       const auto &first = samples.front();

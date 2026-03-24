@@ -161,24 +161,16 @@ private:
     const uint64_t prev_total = prev_total_jiffies_;
     const uint64_t prev_idle = prev_idle_jiffies_;
 
+    if (prev_total > 0) {
+      uint64_t d_total = total - prev_total;
+      uint64_t d_idle = idle_total - prev_idle;
+      if (d_total > 0) {
+        s.cpu_total_pct = 100.0 * (1.0 - static_cast<double>(d_idle) / d_total);
+      }
+    }
+
     prev_total_jiffies_ = total;
     prev_idle_jiffies_ = idle_total;
-
-    if (prev_total == 0) {
-      spdlog::debug(
-          "CPU util baseline established: total_jiffies={}, idle_jiffies={}",
-          total, idle_total);
-      return false;
-    }
-
-    uint64_t d_total = total - prev_total;
-    uint64_t d_idle = idle_total - prev_idle;
-
-    if (d_total > 0) {
-      s.cpu_total_pct = 100.0 * (1.0 - static_cast<double>(d_idle) / d_total);
-    } else {
-      s.cpu_total_pct = 0.0;
-    }
 
     spdlog::debug("CPU util sample: total_jiffies={}, idle_jiffies={}, "
                   "prev_total={}, prev_idle={}, cpu_total_pct={:.3f}",
