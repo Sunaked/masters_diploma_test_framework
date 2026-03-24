@@ -130,8 +130,8 @@ private:
             s.page_faults, s.llc_misses);
       }
 
-      std::this_thread::sleep_for(
-          std::chrono::milliseconds(sampling_interval_ms_));
+      std::this_thread::sleep_for(std::chrono::milliseconds(
+          sampling_interval_ms_)); // sleep for config.metrics_sampling_ms
     }
     spdlog::debug("SystemSampler loop end");
   }

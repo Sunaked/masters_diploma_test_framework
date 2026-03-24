@@ -237,9 +237,14 @@ compute_run_plans(const std::vector<ContainerConfig> &containers,
         (num_configs > 0) ? std::max(global.min_runs_per_config, num_configs)
                           : global.base_runs_per_config;
 
-    runs_per_config = std::min(runs_per_config, global.base_runs_per_config);
-    runs_per_config = std::max(runs_per_config, global.min_runs_per_config);
+    // runs_per_config = std::min(runs_per_config, global.base_runs_per_config);
+    // runs_per_config = std::max(runs_per_config, global.min_runs_per_config);
 
+    spdlog::debug("compute_run_plans, container_name='{}', "
+                  "container_type='{}', runs_per_config='{}', "
+                  "min_runs_per_config='{}', base_runs_per_config='{}",
+                  plan.container_name, plan.container_type, runs_per_config,
+                  global.min_runs_per_config, global.base_runs_per_config);
     for (const auto &sc : scenarios) {
       for (uint32_t thr : threads_list) {
         plan.configs.push_back({sc.name, thr, runs_per_config});
@@ -333,13 +338,6 @@ int main(int argc, char *argv[]) {
     spdlog::info("=== Container: {} (type: {}) ===", plan.container_name,
                  plan.container_type);
 
-    auto container = create_container(plan.container_type);
-    if (!container) {
-      spdlog::error("Skipping container '{}'", plan.container_name);
-      continue;
-    }
-    spdlog::debug("Created container ({})", plan.container_type);
-
     for (const auto &cfg : plan.configs) {
       const Scenario *scenario = nullptr;
       for (const auto &sc : scenarios) {
@@ -355,12 +353,22 @@ int main(int argc, char *argv[]) {
                    cfg.scenario_name, cfg.thread_count, cfg.num_runs);
 
       for (uint32_t run = 0; run < cfg.num_runs; ++run) {
+        auto container = create_container(plan.container_type);
+        if (!container) {
+          spdlog::error("Skipping container '{}'", plan.container_name);
+          continue;
+        }
+        spdlog::debug("Created container ({})", plan.container_type);
+
         auto rr = execute_run(plan.container_name, *container, *scenario,
                               cfg.thread_count, run, exec_cfg, csv, lua);
 
         std::string key = plan.container_name + "|" + cfg.scenario_name + "|" +
                           std::to_string(cfg.thread_count);
         results_by_key[key].push_back(std::move(rr));
+        spdlog::debug(
+            "Deleted ({})",
+            key); // clean start ; deleted mean destroyed by destructor
       }
     }
   }

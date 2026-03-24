@@ -137,7 +137,8 @@ inline RunResult execute_run(const std::string &container_name,
   std::barrier sync_start(thread_count + 1);
   std::barrier sync_end(thread_count + 1);
 
-  SystemSampler sampler(config.metrics_sampling_ms);
+  SystemSampler sampler(
+      config.metrics_sampling_ms); // using metrics_sampling_ms from config
 
   // ---- 5. Рабочие потоки (ГОРЯЧИЙ ЦИКЛ) ----
   std::vector<std::thread> workers;
