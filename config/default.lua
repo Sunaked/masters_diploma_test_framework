@@ -11,16 +11,16 @@
 -- ============================================================================
 
 global = {
-	target_total_time_minutes = 5,
-	base_runs_per_config = 5,
-	min_runs_per_config = 3,
-	metrics_sampling_ms = 200,
+	target_total_time_minutes = 15,
+	base_runs_per_config = 10,
+	min_runs_per_config = 10,
+	metrics_sampling_ms = 100,
 	pin_threads = true,
 	use_rdtsc_for_latency = true,
 }
 
 --threads_list = {1, 2, 4, 8, 16, 24, 32, 48, 64}
-threads_list = { 1, 4 }
+threads_list = { 1, 4, 6 }
 
 containers = {
 	{
@@ -97,101 +97,101 @@ scenarios = {
 	-- ====================================================================
 	-- 1. Probabilistic: классический YCSB-стиль
 	-- ====================================================================
-	{
-		name = "steady_zipfian_70r_20i_10d",
-		phases = {
-			{
-				mode = "probabilistic", -- можно опустить, это default
-				ops_per_thread = 100000,
-				insert = 0.20,
-				find = 0.70,
-				erase = 0.10,
-				key_dist = "zipfian",
-				alpha = 0.99,
-				key_range = 10000000,
-			},
-		},
-	},
+	--{
+	--	name = "steady_zipfian_70r_20i_10d",
+	--	phases = {
+	--		{
+	--			mode = "probabilistic", -- можно опустить, это default
+	--			ops_per_thread = 1000000,
+	--			insert = 0.20,
+	--			find = 0.70,
+	--			erase = 0.10,
+	--			key_dist = "zipfian",
+	--			alpha = 0.99,
+	--			key_range = 10000000,
+	--		},
+	--	},
+	--},
 
-	-- ====================================================================
-	-- 2. ScriptedStep: Lua callback per operation
-	-- ====================================================================
-	{
-		name = "alternating_hotspot_scripted",
-		phases = {
-			{
-				mode = "scripted_step",
-				ops_per_thread = 50000,
-				script = "alternating_hotspot", -- имя Lua-функции выше
-				key_range = 1000000, -- передаётся в ctx
-			},
-		},
-	},
+	---- ====================================================================
+	---- 2. ScriptedStep: Lua callback per operation
+	---- ====================================================================
+	--{
+	--	name = "alternating_hotspot_scripted",
+	--	phases = {
+	--		{
+	--			mode = "scripted_step",
+	--			ops_per_thread = 5000000,
+	--			script = "alternating_hotspot", -- имя Lua-функции выше
+	--			key_range = 1000000, -- передаётся в ctx
+	--		},
+	--	},
+	--},
 
-	{
-		name = "scan_then_read_scripted",
-		phases = {
-			{
-				mode = "scripted_step",
-				ops_per_thread = 100000,
-				script = "scan_then_read",
-				key_range = 10000000,
-			},
-		},
-	},
+	--{
+	--	name = "scan_then_read_scripted",
+	--	phases = {
+	--		{
+	--			mode = "scripted_step",
+	--			ops_per_thread = 1000000,
+	--			script = "scan_then_read",
+	--			key_range = 10000000,
+	--		},
+	--	},
+	--},
 
-	{
-		name = "burst_pattern_scripted",
-		phases = {
-			{
-				mode = "scripted_step",
-				ops_per_thread = 80000,
-				script = "burst_pattern",
-				key_range = 1000000,
-			},
-		},
-	},
+	--{
+	--	name = "burst_pattern_scripted",
+	--	phases = {
+	--		{
+	--			mode = "scripted_step",
+	--			ops_per_thread = 800000,
+	--			script = "burst_pattern",
+	--			key_range = 1000000,
+	--		},
+	--	},
+	--},
 
-	-- ====================================================================
-	-- 3. ScriptedPlan: декларативный план (без Lua-вызовов при генерации)
-	-- ====================================================================
-	{
-		name = "prefill_then_hotspot_plan",
-		phases = {
-			{
-				mode = "scripted_plan",
-				plan = {
-					-- Фаза 1: последовательная вставка 50K ключей (prefill)
-					{ count = 50000, op = "insert", key_mode = "sequential", start = 0 },
+	---- ====================================================================
+	---- 3. ScriptedPlan: декларативный план (без Lua-вызовов при генерации)
+	---- ====================================================================
+	--{
+	--	name = "prefill_then_hotspot_plan",
+	--	phases = {
+	--		{
+	--			mode = "scripted_plan",
+	--			plan = {
+	--				-- Фаза 1: последовательная вставка 50K ключей (prefill)
+	--				{ count = 500000, op = "insert", key_mode = "sequential", start = 0 },
 
-					-- Фаза 2: горячий find по одному ключу (hotspot)
-					{ count = 100000, op = "find", key_mode = "fixed", fixed_key = 42 },
+	--				-- Фаза 2: горячий find по одному ключу (hotspot)
+	--				{ count = 1000000, op = "find", key_mode = "fixed", fixed_key = 42 },
 
-					-- Фаза 3: удаление по Zipfian
-					{ count = 30000, op = "erase", key_mode = "zipfian", key_range = 50000, alpha = 0.99 },
-				},
-			},
-		},
-	},
+	--				-- Фаза 3: удаление по Zipfian
+	--				{ count = 300000, op = "erase", key_mode = "zipfian", key_range = 50000, alpha = 0.99 },
+	--			},
+	--		},
+	--	},
+	--},
 
-	{
-		name = "mixed_plan_uniform",
-		phases = {
-			{
-				mode = "scripted_plan",
-				plan = {
-					-- Bulk insert
-					{ count = 100000, op = "insert", key_mode = "uniform", key_range = 10000000 },
+	--{
+	--	name = "mixed_plan_uniform",
+	--	phases = {
+	--		{
+	--			mode = "scripted_plan",
+	--			plan = {
+	--				-- Bulk insert
+	--				{ count = 100000, op = "insert", key_mode = "uniform", key_range = 10000000 },
 
-					-- Read-heavy phase
-					{ count = 200000, op = "find", key_mode = "uniform", key_range = 10000000 },
+	--				-- Read-heavy phase
+	--				{ count = 200000, op = "find", key_mode = "uniform", key_range = 10000000 },
 
-					-- Cleanup
-					{ count = 50000, op = "erase", key_mode = "uniform", key_range = 10000000 },
-				},
-			},
-		},
-	},
+	--				-- Cleanup
+	--				{ count = 50000, op = "erase", key_mode = "uniform", key_range = 10000000 },
+	--			},
+	--		},
+	--	},
+	--},
 
 	-- ====================================================================
 	-- 4. Многофазный сценарий: микс режимов в одном сценарии
@@ -203,13 +203,13 @@ scenarios = {
 			{
 				mode = "scripted_plan",
 				plan = {
-					{ count = 1000000, op = "insert", key_mode = "sequential", start = 0 },
+					{ count = 4000000, op = "insert", key_mode = "sequential", start = 0 },
 				},
 			},
 			-- Фаза 2: read-heavy probabilistic
 			{
 				mode = "probabilistic",
-				ops_per_thread = 2000000,
+				ops_per_thread = 8000000,
 				insert = 0.05,
 				find = 0.90,
 				erase = 0.05,
@@ -220,7 +220,7 @@ scenarios = {
 			-- Фаза 3: scripted cleanup
 			{
 				mode = "scripted_step",
-				ops_per_thread = 500000,
+				ops_per_thread = 2000000,
 				script = "alternating_hotspot",
 				key_range = 100000,
 			},
