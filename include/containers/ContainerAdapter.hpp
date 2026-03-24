@@ -18,8 +18,8 @@
 // ============================================================================
 
 #include <cstdint>
-#include <string>
 #include <memory>
+#include <string>
 
 namespace bench {
 
@@ -34,28 +34,25 @@ namespace bench {
 ///   bool do_erase(uint64_t key)
 ///   void do_clear()
 ///   std::string do_name() const
-template <typename Derived>
-class ContainerCRTP {
+template <typename Derived> class ContainerCRTP {
 public:
-    bool insert(uint64_t key, uint64_t value) {
-        return static_cast<Derived*>(this)->do_insert(key, value);
-    }
+  bool insert(uint64_t key, uint64_t value) {
+    return static_cast<Derived *>(this)->do_insert(key, value);
+  }
 
-    bool find(uint64_t key, uint64_t& value) {
-        return static_cast<Derived*>(this)->do_find(key, value);
-    }
+  bool find(uint64_t key, uint64_t &value) {
+    return static_cast<Derived *>(this)->do_find(key, value);
+  }
 
-    bool erase(uint64_t key) {
-        return static_cast<Derived*>(this)->do_erase(key);
-    }
+  bool erase(uint64_t key) {
+    return static_cast<Derived *>(this)->do_erase(key);
+  }
 
-    void clear() {
-        static_cast<Derived*>(this)->do_clear();
-    }
+  void clear() { static_cast<Derived *>(this)->do_clear(); }
 
-    std::string name() const {
-        return static_cast<const Derived*>(this)->do_name();
-    }
+  std::string name() const {
+    return static_cast<const Derived *>(this)->do_name();
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -65,45 +62,39 @@ public:
 /// Виртуальный интерфейс — используется ТОЛЬКО для:
 ///   1. Создания контейнера по имени из Lua-конфигурации (фабрика)
 ///   2. Передачи в executor (type-erased ownership)
-/// Горячий путь всё равно вызывает через шаблонный executor (см. MultiThreadExecutor).
+/// Горячий путь всё равно вызывает через шаблонный executor (см.
+/// MultiThreadExecutor).
 class ContainerBase {
 public:
-    virtual ~ContainerBase() = default;
+  virtual ~ContainerBase() = default;
 
-    virtual bool insert(uint64_t key, uint64_t value) = 0;
-    virtual bool find(uint64_t key, uint64_t& value) = 0;
-    virtual bool erase(uint64_t key) = 0;
-    virtual void clear() = 0;
-    virtual std::string name() const = 0;
+  virtual bool insert(uint64_t key, uint64_t value) = 0;
+  virtual bool find(uint64_t key, uint64_t &value) = 0;
+  virtual bool erase(uint64_t key) = 0;
+  virtual void clear() = 0;
+  virtual std::string name() const = 0;
 };
 
 /// Мост CRTP → virtual (для type-erasure при хранении в контейнере).
-template <typename Derived>
-class ContainerBridge : public ContainerBase {
+template <typename Derived> class ContainerBridge : public ContainerBase {
 public:
-    bool insert(uint64_t key, uint64_t value) override {
-        return impl_.insert(key, value);
-    }
-    bool find(uint64_t key, uint64_t& value) override {
-        return impl_.find(key, value);
-    }
-    bool erase(uint64_t key) override {
-        return impl_.erase(key);
-    }
-    void clear() override {
-        impl_.clear();
-    }
-    std::string name() const override {
-        return impl_.name();
-    }
+  bool insert(uint64_t key, uint64_t value) override {
+    return impl_.insert(key, value);
+  }
+  bool find(uint64_t key, uint64_t &value) override {
+    return impl_.find(key, value);
+  }
+  bool erase(uint64_t key) override { return impl_.erase(key); }
+  void clear() override { impl_.clear(); }
+  std::string name() const override { return impl_.name(); }
 
-    Derived& get() { return impl_; }
+  Derived &get() { return impl_; }
 
 protected:
-    Derived impl_;
+  Derived impl_;
 };
 
 /// Фабрика контейнеров (регистрация — в main.cpp).
-using ContainerFactory = std::unique_ptr<ContainerBase>(*)();
+using ContainerFactory = std::unique_ptr<ContainerBase> (*)();
 
 } // namespace bench

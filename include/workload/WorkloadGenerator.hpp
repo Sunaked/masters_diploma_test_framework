@@ -111,9 +111,10 @@ generate_scenario_ops(const Scenario &scenario, uint32_t thread_count,
     const auto &phase = scenario.phases[pi];
     std::vector<std::vector<Op>> phase_ops(thread_count);
 
-    spdlog::debug("Generating phase {}/{}: mode={}, scenario='{}'", pi + 1,
-                  scenario.phases.size(), static_cast<int>(phase.mode),
-                  scenario.name);
+    spdlog::debug(
+        "Generating phase {}/{}: mode={}, scenario='{}', for thread amount={}",
+        pi + 1, scenario.phases.size(), static_cast<int>(phase.mode),
+        scenario.name, thread_count);
 
     for (uint32_t tid = 0; tid < thread_count; ++tid) {
       uint64_t phase_seed = config.base_seed + pi * 1'000'000 + tid;

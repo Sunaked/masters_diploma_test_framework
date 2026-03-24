@@ -355,8 +355,8 @@ int main(int argc, char *argv[]) {
                    cfg.scenario_name, cfg.thread_count, cfg.num_runs);
 
       for (uint32_t run = 0; run < cfg.num_runs; ++run) {
-        auto rr = execute_run(*container, *scenario, cfg.thread_count, run,
-                              exec_cfg, csv, lua);
+        auto rr = execute_run(plan.container_name, *container, *scenario,
+                              cfg.thread_count, run, exec_cfg, csv, lua);
 
         std::string key = plan.container_name + "|" + cfg.scenario_name + "|" +
                           std::to_string(cfg.thread_count);

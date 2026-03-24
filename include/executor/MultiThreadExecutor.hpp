@@ -94,13 +94,14 @@ struct ExecutorConfig {
 // execute_run
 // ---------------------------------------------------------------------------
 
-inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
+inline RunResult execute_run(const std::string &container_name,
+                             ContainerBase &container, const Scenario &scenario,
                              uint32_t thread_count, uint32_t run_index,
                              const ExecutorConfig &config, CsvWriter &csv,
                              sol::state &lua) {
   spdlog::debug("execute_run begin: container='{}', scenario='{}', threads={}, "
                 "run_index={}",
-                container.name(), scenario.name, thread_count, run_index);
+                container_name, scenario.name, thread_count, run_index);
 
   // ---- 1. Предвычисление операций ----
   WorkloadConfig wc;
@@ -253,7 +254,7 @@ inline RunResult execute_run(ContainerBase &container, const Scenario &scenario,
   }
 
   RunResult rr;
-  rr.container_name = container.name();
+  rr.container_name = container_name;
   rr.scenario_name = scenario.name;
   rr.thread_count = thread_count;
   rr.run_index = run_index;
