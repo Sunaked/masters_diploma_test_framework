@@ -1,11 +1,6 @@
 // ============================================================================
 // main.cpp — точка входа бенчмарк-фреймворка.
 //
-// Вывод организован в results/run_YY_MM_DD_HHMMSS/:
-//   config_global.csv, config_containers.csv, config_scenarios.csv,
-//   config_plan_entries.csv (если есть ScriptedPlan),
-//   ops/<scenario>_phase<N>_thread<M>.csv,
-//   raw_results.csv, summary.csv, system_metrics.csv
 // ============================================================================
 
 #include "containers/ContainerAdapter.hpp"
@@ -42,6 +37,12 @@ struct GlobalConfig {
   uint32_t metrics_sampling_ms = 200;
   bool pin_threads = true;
   bool use_rdtsc_for_latency = true;
+
+  bool latency_off = false;
+  bool sampler_off = false;
+  std::string latency_mode = "cycles"; // "cycles", "wall_ns", "both"
+  size_t reservoir_capacity = 1'000'000;
+  double warmup_auto_seconds = 0.0;
 };
 
 struct ContainerConfig {
@@ -63,6 +64,14 @@ GlobalConfig load_global(sol::state &lua) {
   g.metrics_sampling_ms = tbl.get_or("metrics_sampling_ms", 200u);
   g.pin_threads = tbl.get_or("pin_threads", true);
   g.use_rdtsc_for_latency = tbl.get_or("use_rdtsc_for_latency", true);
+
+  g.latency_off = tbl.get_or("latency_off", false);
+  g.sampler_off = tbl.get_or("sampler_off", false);
+  g.latency_mode = tbl.get_or<std::string>("latency_mode", "cycles");
+  g.reservoir_capacity =
+      tbl.get_or("reservoir_capacity", static_cast<uint64_t>(1'000'000));
+  g.warmup_auto_seconds = tbl.get_or("warmup_auto_seconds", 0.0);
+
   return g;
 }
 
@@ -116,6 +125,10 @@ std::vector<Scenario> load_scenarios(sol::state &lua) {
       Phase ph;
 
       std::string mode_str = p.get_or<std::string>("mode", "probabilistic");
+
+      // phase role
+      std::string role_str = p.get_or<std::string>("role", "measure");
+      ph.role = parse_phase_role(role_str);
 
       if (mode_str == "probabilistic") {
         ph.mode = PhaseMode::Probabilistic;
@@ -195,9 +208,13 @@ std::vector<Scenario> load_scenarios(sol::state &lua) {
 // Фабрика контейнеров
 // ============================================================================
 
+// NullContainer support
 std::unique_ptr<ContainerBase> create_container(const std::string &type) {
   if (type == "custom") {
     return std::make_unique<ContainerBridge<ShardedHashMap<256>>>();
+  }
+  if (type == "null") {
+    return std::make_unique<NullContainer>();
   }
   spdlog::error("Unknown container type: '{}'", type);
   return nullptr;
@@ -237,12 +254,9 @@ compute_run_plans(const std::vector<ContainerConfig> &containers,
         (num_configs > 0) ? std::max(global.min_runs_per_config, num_configs)
                           : global.base_runs_per_config;
 
-    // runs_per_config = std::min(runs_per_config, global.base_runs_per_config);
-    // runs_per_config = std::max(runs_per_config, global.min_runs_per_config);
-
     spdlog::debug("compute_run_plans, container_name='{}', "
                   "container_type='{}', runs_per_config='{}', "
-                  "min_runs_per_config='{}', base_runs_per_config='{}",
+                  "min_runs_per_config='{}', base_runs_per_config='{}'",
                   plan.container_name, plan.container_type, runs_per_config,
                   global.min_runs_per_config, global.base_runs_per_config);
     for (const auto &sc : scenarios) {
@@ -302,11 +316,11 @@ int main(int argc, char *argv[]) {
   auto plans =
       compute_run_plans(container_cfg, scenarios, threads_list, global_cfg);
 
-  // ---- Подготовка вывода (создаёт results/run_YY_MM_DD_HHMMSS/) ----
+  // ---- Подготовка вывода ----
   CsvWriter csv("results");
   csv.write_raw_header();
 
-  // ---- Дамп входных параметров в config_*.csv ----
+  // ---- Дамп входных параметров ----
   csv.dump_config_global(
       global_cfg.target_total_time_minutes, global_cfg.base_runs_per_config,
       global_cfg.min_runs_per_config, global_cfg.metrics_sampling_ms,
@@ -333,6 +347,18 @@ int main(int argc, char *argv[]) {
   exec_cfg.use_rdtsc = global_cfg.use_rdtsc_for_latency;
   exec_cfg.metrics_sampling_ms = global_cfg.metrics_sampling_ms;
   exec_cfg.dump_ops = true;
+
+  exec_cfg.latency_off = global_cfg.latency_off;
+  exec_cfg.sampler_off = global_cfg.sampler_off;
+  exec_cfg.reservoir_capacity = global_cfg.reservoir_capacity;
+  exec_cfg.warmup_auto_seconds = global_cfg.warmup_auto_seconds;
+
+  if (global_cfg.latency_mode == "wall_ns")
+    exec_cfg.latency_mode = LatencyMode::WallNs;
+  else if (global_cfg.latency_mode == "both")
+    exec_cfg.latency_mode = LatencyMode::Both;
+  else
+    exec_cfg.latency_mode = LatencyMode::Cycles;
 
   for (const auto &plan : plans) {
     spdlog::info("=== Container: {} (type: {}) ===", plan.container_name,
@@ -366,9 +392,7 @@ int main(int argc, char *argv[]) {
         std::string key = plan.container_name + "|" + cfg.scenario_name + "|" +
                           std::to_string(cfg.thread_count);
         results_by_key[key].push_back(std::move(rr));
-        spdlog::debug(
-            "Deleted ({})",
-            key); // clean start ; deleted mean destroyed by destructor
+        spdlog::debug("Deleted ({})", key);
       }
     }
   }
@@ -407,6 +431,7 @@ int main(int argc, char *argv[]) {
   spdlog::info("  Raw:     {}", csv.raw_path());
   spdlog::info("  Summary: {}", csv.summary_path());
   spdlog::info("  Ops:     {}", csv.ops_dir());
+  spdlog::info("  Phases:  {}", csv.phase_results_path());
 
   return 0;
 }

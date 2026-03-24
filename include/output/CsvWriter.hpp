@@ -2,20 +2,6 @@
 // ============================================================================
 // CsvWriter.hpp — вывод результатов бенчмарка в CSV.
 //
-// Структура вывода (один эксперимент = одна папка):
-//
-//   results/run_25_03_24_143022/
-//     config_global.csv          — глобальные параметры
-//     config_containers.csv      — список контейнеров с бюджетами времени
-//     config_scenarios.csv       — описание всех фаз всех сценариев
-//     ops/                       — предвычисленные trace для каждого (scenario,
-//     phase, thread)
-//       <scenario>_phase<N>_thread<M>.csv
-//     raw_results.csv            — каждая строка = один прогон
-//     summary.csv                — агрегированные статистики
-//     system_metrics.csv         — системные метрики с временными метками
-//
-// Формат CSV для совместимости с pandas, R, gnuplot, Excel.
 // ============================================================================
 
 #include "metrics/Statistics.hpp"
@@ -36,9 +22,23 @@
 
 namespace bench {
 
-// ---------------------------------------------------------------------------
-// RunResult / SummaryEntry (без изменений)
-// ---------------------------------------------------------------------------
+struct PhaseResult {
+  size_t phase_index = 0;
+  std::string phase_role; // "measure", "warmup", etc.
+  uint64_t ops = 0;
+  double duration_sec = 0.0;
+  double throughput_ops = 0.0;
+  // Cycle latency
+  double lat_cyc_p50 = 0.0;
+  double lat_cyc_p95 = 0.0;
+  double lat_cyc_p99 = 0.0;
+  double lat_cyc_p999 = 0.0;
+  // Wall-clock latency (ns)
+  double lat_wall_p50 = 0.0;
+  double lat_wall_p95 = 0.0;
+  double lat_wall_p99 = 0.0;
+  double lat_wall_p999 = 0.0;
+};
 
 struct RunResult {
   std::string container_name;
@@ -51,13 +51,24 @@ struct RunResult {
   double duration_sec = 0.0;
   double throughput_ops = 0.0;
 
+  // Cycle latency (original fields, backward compat)
   double lat_p50 = 0.0;
   double lat_p95 = 0.0;
   double lat_p99 = 0.0;
   double lat_p999 = 0.0;
 
+  // Dual latency
+  double lat_wall_p50 = 0.0;
+  double lat_wall_p95 = 0.0;
+  double lat_wall_p99 = 0.0;
+  double lat_wall_p999 = 0.0;
+  std::string latency_mode = "cycles"; // "cycles", "wall_ns", "both"
+
   double avg_cpu_pct = 0.0;
   double avg_rss_mb = 0.0;
+
+  // Per-phase results
+  std::vector<PhaseResult> phase_results;
 };
 
 struct SummaryEntry {
@@ -77,7 +88,6 @@ struct SummaryEntry {
 
 class CsvWriter {
 public:
-  /// Создаёт директорию results/run_YY_MM_DD_HHMMSS/ .
   explicit CsvWriter(const std::string &base_dir = "results") {
     run_dir_ = base_dir + "/" + make_run_dirname();
     ops_dir_ = run_dir_ + "/ops";
@@ -88,6 +98,7 @@ public:
     raw_path_ = run_dir_ + "/raw_results.csv";
     summary_path_ = run_dir_ + "/summary.csv";
     system_path_ = run_dir_ + "/system_metrics.csv";
+    phase_results_path_ = run_dir_ + "/phase_results.csv";
 
     spdlog::info("Output directory: {}", run_dir_);
   }
@@ -96,7 +107,6 @@ public:
   // Конфигурация (входные параметры)
   // =====================================================================
 
-  /// Дампит глобальные параметры в config_global.csv.
   void dump_config_global(double target_total_time_minutes,
                           uint32_t base_runs_per_config,
                           uint32_t min_runs_per_config,
@@ -113,8 +123,6 @@ public:
         << "pin_threads," << (pin_threads ? "true" : "false") << "\n"
         << "use_rdtsc_for_latency,"
         << (use_rdtsc_for_latency ? "true" : "false") << "\n";
-
-      // threads_list как отдельная строка
       f << "threads_list,\"";
       for (size_t i = 0; i < threads_list.size(); ++i) {
         if (i > 0)
@@ -126,7 +134,6 @@ public:
     spdlog::debug("Dumped config_global.csv");
   }
 
-  /// Дампит список контейнеров в config_containers.csv.
   void dump_config_containers(const std::vector<std::string> &names,
                               const std::vector<std::string> &types,
                               const std::vector<double> &target_minutes) {
@@ -138,10 +145,9 @@ public:
     spdlog::debug("Dumped config_containers.csv ({} containers)", names.size());
   }
 
-  /// Дампит описание всех сценариев и фаз в config_scenarios.csv.
   void dump_config_scenarios(const std::vector<Scenario> &scenarios) {
     std::ofstream f(run_dir_ + "/config_scenarios.csv");
-    f << "scenario,phase_index,mode,"
+    f << "scenario,phase_index,mode,role,"
          "ops_per_thread,insert_ratio,find_ratio,erase_ratio,"
          "key_dist,alpha,key_range,"
          "lua_generator,"
@@ -150,13 +156,13 @@ public:
     for (const auto &sc : scenarios) {
       for (size_t pi = 0; pi < sc.phases.size(); ++pi) {
         const auto &ph = sc.phases[pi];
-
         f << sc.name << "," << pi << ",";
 
         switch (ph.mode) {
         case PhaseMode::Probabilistic:
-          f << "probabilistic," << ph.ops_per_thread << "," << ph.insert_ratio
-            << "," << ph.find_ratio << "," << ph.erase_ratio << ",";
+          f << "probabilistic," << to_string(ph.role) << "," // === v2 ===
+            << ph.ops_per_thread << "," << ph.insert_ratio << ","
+            << ph.find_ratio << "," << ph.erase_ratio << ",";
           switch (ph.key_dist) {
           case KeyDist::Uniform:
             f << "uniform,";
@@ -174,7 +180,8 @@ public:
           break;
 
         case PhaseMode::ScriptedStep:
-          f << "scripted_step," << ph.ops_per_thread << ","
+          f << "scripted_step," << to_string(ph.role) << "," // === v2 ===
+            << ph.ops_per_thread << ","
             << ",,,"; // ratios empty
           f << ","    // key_dist empty
             << ph.alpha << "," << ph.key_range << "," << ph.lua_generator_name
@@ -183,24 +190,15 @@ public:
           break;
 
         case PhaseMode::ScriptedPlan:
-          f << "scripted_plan," << ph.ops_per_thread << ","
-            << ",,,,,,,"; // ratios/dist/alpha/range/lua empty
+          f << "scripted_plan," << to_string(ph.role) << "," // === v2 ===
+            << ph.ops_per_thread << ","
+            << ",,,,,,,";
           f << ph.plan_entries.size() << "\n";
-
-          // Дампим plan entries как дополнительные строки
-          for (size_t ei = 0; ei < ph.plan_entries.size(); ++ei) {
-            const auto &pe = ph.plan_entries[ei];
-            // Переиспользуем формат, но с пометкой в scenario
-            // (отдельный CSV был бы чище, но держим всё в одном файле)
-          }
           break;
         }
       }
     }
-
-    // Отдельный CSV для plan entries (если есть)
     dump_plan_entries(scenarios);
-
     spdlog::debug("Dumped config_scenarios.csv ({} scenarios)",
                   scenarios.size());
   }
@@ -209,17 +207,11 @@ public:
   // Операции (предвычисленный trace)
   // =====================================================================
 
-  /// Дампит предвычисленные операции для одного (scenario, phase, thread).
-  /// Вызывается после generate_scenario_ops, до горячего цикла.
-  ///
-  /// Файл: ops/<scenario>_phase<N>_thread<M>.csv
-  /// Формат: op_index,op_type,key
   void dump_ops_trace(const std::string &scenario_name, size_t phase_index,
                       uint32_t thread_id, const std::vector<Op> &ops) {
     std::string filename = ops_dir_ + "/" + scenario_name + "_phase" +
                            std::to_string(phase_index) + "_thread" +
                            std::to_string(thread_id) + ".csv";
-
     std::ofstream f(filename);
     f << "op_index,op_type,key\n";
     for (size_t i = 0; i < ops.size(); ++i) {
@@ -227,8 +219,6 @@ public:
     }
   }
 
-  /// Дампит все trace для всего сценария (все фазы, все потоки).
-  /// all_ops[phase_index][thread_id] = vector<Op>
   void dump_all_ops(const std::string &scenario_name,
                     const std::vector<std::vector<std::vector<Op>>> &all_ops) {
     for (size_t pi = 0; pi < all_ops.size(); ++pi) {
@@ -246,11 +236,14 @@ public:
   // Метрики (выходные данные)
   // =====================================================================
 
+  // dual latency columns
   void write_raw_header() {
     std::ofstream f(raw_path_, std::ios::trunc);
     f << "container,scenario,threads,run,"
          "total_ops,duration_sec,throughput_ops_sec,"
          "lat_p50_cycles,lat_p95_cycles,lat_p99_cycles,lat_p999_cycles,"
+         "lat_p50_wall_ns,lat_p95_wall_ns,lat_p99_wall_ns,lat_p999_wall_ns,"
+         "latency_mode,"
          "avg_cpu_pct,avg_rss_mb,avg_cs_per_sec\n";
   }
 
@@ -259,8 +252,38 @@ public:
     f << r.container_name << "," << r.scenario_name << "," << r.thread_count
       << "," << r.run_index << "," << r.total_ops << "," << r.duration_sec
       << "," << r.throughput_ops << "," << r.lat_p50 << "," << r.lat_p95 << ","
-      << r.lat_p99 << "," << r.lat_p999 << "," << r.avg_cpu_pct << ","
-      << r.avg_rss_mb << "," << r.avg_cs_per_sec << "\n";
+      << r.lat_p99 << "," << r.lat_p999 << "," << r.lat_wall_p50 << ","
+      << r.lat_wall_p95 << "," << r.lat_wall_p99 << "," << r.lat_wall_p999
+      << "," << r.latency_mode << "," << r.avg_cpu_pct << "," << r.avg_rss_mb
+      << "," << r.avg_cs_per_sec << "\n";
+  }
+
+  // Per-phase CSV
+  void write_phase_results(const RunResult &r) {
+    if (r.phase_results.empty())
+      return;
+
+    std::ios_base::openmode mode =
+        phase_header_written_ ? std::ios::app : std::ios::trunc;
+    std::ofstream f(phase_results_path_, mode);
+
+    if (!phase_header_written_) {
+      f << "container,scenario,threads,run,phase_index,phase_role,"
+           "ops,duration_sec,throughput_ops_sec,"
+           "lat_cyc_p50,lat_cyc_p95,lat_cyc_p99,lat_cyc_p999,"
+           "lat_wall_p50_ns,lat_wall_p95_ns,lat_wall_p99_ns,lat_wall_p999_ns\n";
+      phase_header_written_ = true;
+    }
+
+    for (const auto &pr : r.phase_results) {
+      f << r.container_name << "," << r.scenario_name << "," << r.thread_count
+        << "," << r.run_index << "," << pr.phase_index << "," << pr.phase_role
+        << "," << pr.ops << "," << pr.duration_sec << "," << pr.throughput_ops
+        << "," << pr.lat_cyc_p50 << "," << pr.lat_cyc_p95 << ","
+        << pr.lat_cyc_p99 << "," << pr.lat_cyc_p999 << "," << pr.lat_wall_p50
+        << "," << pr.lat_wall_p95 << "," << pr.lat_wall_p99 << ","
+        << pr.lat_wall_p999 << "\n";
+    }
   }
 
   void write_summary(const std::vector<SummaryEntry> &entries) {
@@ -315,6 +338,7 @@ public:
   const std::string &summary_path() const { return summary_path_; }
   const std::string &system_path() const { return system_path_; }
   const std::string &ops_dir() const { return ops_dir_; }
+  const std::string &phase_results_path() const { return phase_results_path_; }
 
 private:
   std::string run_dir_;
@@ -322,9 +346,10 @@ private:
   std::string raw_path_;
   std::string summary_path_;
   std::string system_path_;
+  std::string phase_results_path_;
   bool system_header_written_ = false;
+  bool phase_header_written_ = false;
 
-  /// Генерирует имя директории: run_YY_MM_DD_HHMMSS
   static std::string make_run_dirname() {
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
@@ -339,7 +364,6 @@ private:
     return ss.str();
   }
 
-  /// Дампит plan entries для ScriptedPlan фаз.
   void dump_plan_entries(const std::vector<Scenario> &scenarios) {
     bool has_plans = false;
     for (const auto &sc : scenarios) {
@@ -369,7 +393,6 @@ private:
           const auto &pe = ph.plan_entries[ei];
           f << sc.name << "," << pi << "," << ei << "," << pe.count << ","
             << to_string(pe.op) << ",";
-
           switch (pe.key_mode) {
           case PlanKeyMode::Sequential:
             f << "sequential,";
@@ -384,7 +407,6 @@ private:
             f << "zipfian,";
             break;
           }
-
           f << pe.start << "," << pe.fixed_key << "," << pe.key_range << ","
             << pe.alpha << "\n";
         }

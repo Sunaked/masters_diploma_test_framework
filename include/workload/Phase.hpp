@@ -2,22 +2,6 @@
 // ============================================================================
 // Phase.hpp — описание одной фазы сценария нагрузки.
 //
-// Три режима генерации trace (PhaseMode):
-//
-//   1. Probabilistic — классический YCSB-стиль: вероятностный вектор
-//      w = (p_insert, p_find, p_erase) + распределение ключей.
-//      Формализация:  S = (w, D_key, N_m)
-//
-//   2. ScriptedStep — Lua-функция задаёт каждую операцию по индексу:
-//        function gen(ctx, i) return { op = "insert", key = i } end
-//      Вызывается ТОЛЬКО при прегенерации. Горячий цикл не трогает Lua.
-//
-//   3. ScriptedPlan — декларативный план высокого уровня:
-//        { count = 10000, op = "insert", key_mode = "sequential" }
-//      Компактно описывает bursts, prefill, hotspot-ы.
-//
-// Методологическое требование: для одного (scenario, threads, run_index)
-// все контейнеры получают ИДЕНТИЧНЫЙ trace (один seed → один trace).
 // ============================================================================
 
 #include <cstdint>
@@ -48,7 +32,6 @@ inline const char *to_string(OpType t) {
   return "unknown";
 }
 
-/// Парсинг строки → OpType. Возвращает false при неизвестном значении.
 inline bool parse_op_type(const std::string &s, OpType &out) {
   if (s == "insert") {
     out = OpType::Insert;
@@ -81,6 +64,37 @@ enum class PhaseMode : uint8_t {
   ScriptedPlan = 2,
 };
 
+enum class PhaseRole : uint8_t {
+  Measure = 0,  // DEFAULT: timed, stats recorded in raw_results.csv
+  Prefill = 1,  // Runs OUTSIDE timing entirely. No latency, no stats.
+  Warmup = 2,   // Runs inside timing window but stats DISCARDED from final.
+  Cooldown = 3, // Runs after measurement. Stats discarded.
+};
+
+inline const char *to_string(PhaseRole r) {
+  switch (r) {
+  case PhaseRole::Measure:
+    return "measure";
+  case PhaseRole::Prefill:
+    return "prefill";
+  case PhaseRole::Warmup:
+    return "warmup";
+  case PhaseRole::Cooldown:
+    return "cooldown";
+  }
+  return "unknown";
+}
+
+inline PhaseRole parse_phase_role(const std::string &s) {
+  if (s == "prefill")
+    return PhaseRole::Prefill;
+  if (s == "warmup")
+    return PhaseRole::Warmup;
+  if (s == "cooldown")
+    return PhaseRole::Cooldown;
+  return PhaseRole::Measure; // default for backward compat
+}
+
 // ---------------------------------------------------------------------------
 // Op — одна предвычисленная операция
 // ---------------------------------------------------------------------------
@@ -97,25 +111,20 @@ static_assert(sizeof(Op) == 16,
 // ---------------------------------------------------------------------------
 
 enum class PlanKeyMode : uint8_t {
-  Sequential = 0, ///< key = start + i
-  Fixed = 1,      ///< key = fixed_key (hotspot)
-  Uniform = 2,    ///< key = random uniform [0, key_range)
-  Zipfian = 3,    ///< key = Zipfian(key_range, alpha)
+  Sequential = 0,
+  Fixed = 1,
+  Uniform = 2,
+  Zipfian = 3,
 };
 
-/// Один шаг декларативного плана.
-///
-/// Lua-пример:
-///   { count = 10000, op = "insert", key_mode = "sequential", start = 0 }
-///   { count = 50000, op = "find",   key_mode = "fixed",      fixed_key = 42 }
 struct PlanEntry {
   uint64_t count = 0;
   OpType op = OpType::Insert;
   PlanKeyMode key_mode = PlanKeyMode::Sequential;
-  uint64_t start = 0;             ///< Sequential: начальный ключ
-  uint64_t fixed_key = 0;         ///< Fixed: значение ключа
-  uint64_t key_range = 1'000'000; ///< Uniform / Zipfian
-  double alpha = 0.99;            ///< Zipfian
+  uint64_t start = 0;
+  uint64_t fixed_key = 0;
+  uint64_t key_range = 1'000'000;
+  double alpha = 0.99;
 };
 
 // ---------------------------------------------------------------------------
@@ -125,10 +134,8 @@ struct PlanEntry {
 struct Phase {
   PhaseMode mode = PhaseMode::Probabilistic;
 
-  /// Количество операций на поток.
-  /// - Probabilistic: обязательно
-  /// - ScriptedStep: обязательно (сколько раз вызвать Lua-функцию)
-  /// - ScriptedPlan: игнорируется (определяется суммой count)
+  PhaseRole role = PhaseRole::Measure; // default = measured (backward compat)
+
   uint64_t ops_per_thread = 500;
 
   // ---------- Probabilistic ----------
@@ -140,24 +147,17 @@ struct Phase {
   uint64_t key_range = 1'000'000;
 
   // ---------- ScriptedStep ----------
-  /// Имя Lua-функции: function name(ctx, i) → {op="...", key=N}
   std::string lua_generator_name;
 
   // ---------- ScriptedPlan ----------
   std::vector<PlanEntry> plan_entries;
 };
 
-/// Полный сценарий = имя + упорядоченный набор фаз.
 struct Scenario {
   std::string name;
   std::vector<Phase> phases;
 };
 
-// ---------------------------------------------------------------------------
-// Контекст для Lua scripted генератора
-// ---------------------------------------------------------------------------
-
-/// Передаётся в Lua-функцию как ctx. Не содержит живого состояния контейнера.
 struct LuaPhaseContext {
   std::string scenario_name;
   uint64_t phase_index = 0;

@@ -21,16 +21,17 @@ chmod +x setup.sh
 
 ## Контейнеры
 
-| Контейнер | Тип | Библиотека |
-|---|---|---|
-| SplitListMap | Lock-free (split-ordered list) | libcds |
-| FeldmanHashMap | Lock-free (hash trie) | libcds |
-| CK_HT | Lock-free reads / spinlock writes | Concurrency Kit |
+| Контейнер      | Тип                               | Библиотека             |
+| -------------- | --------------------------------- | ---------------------- |
+| SplitListMap   | Lock-free (split-ordered list)    | libcds                 |
+| FeldmanHashMap | Lock-free (hash trie)             | libcds                 |
+| CK_HT          | Lock-free reads / spinlock writes | Concurrency Kit        |
 | ShardedHashMap | Fine-grained locking (256 шардов) | Собственная реализация |
 
 ## Конфигурация
 
 Файл `config/default.lua` определяет:
+
 - Список потоков (`threads_list`)
 - Контейнеры с бюджетом времени (`target_time_minutes`)
 - Сценарии нагрузки с фазами (пропорции insert/find/erase, распределение ключей)
@@ -97,3 +98,5 @@ parallel-containers-bench/
 ## Лицензия
 
 MIT
+
+TODO: убрать target_time_minutes, target_total_time_minutes,
