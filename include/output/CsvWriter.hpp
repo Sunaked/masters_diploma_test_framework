@@ -250,7 +250,7 @@ public:
     std::ofstream f(raw_path_, std::ios::trunc);
     f << "container,scenario,threads,run,"
          "total_ops,duration_sec,throughput_ops_sec,"
-         "lat_p50_ns,lat_p95_ns,lat_p99_ns,lat_p999_ns,"
+         "lat_p50_cycles,lat_p95_cycles,lat_p99_cycles,lat_p999_cycles,"
          "avg_cpu_pct,avg_rss_mb,avg_cs_per_sec\n";
   }
 
