@@ -57,19 +57,22 @@ public:
   /// Запускает фоновый поток сбора метрик.
   void start() {
     spdlog::debug("SystemSampler start: interval_ms={}", sampling_interval_ms_);
-    running_.store(true, std::memory_order_release);
+    samples_.clear();
+    prev_total_jiffies_ = 0;
+    prev_idle_jiffies_ = 0;
     start_time_ = std::chrono::steady_clock::now();
+    running_.store(true, std::memory_order_release);
     thread_ = std::thread([this] { sample_loop(); });
-
-    // Опционально: привязать поток сэмплера к последнему ядру
-    // чтобы не конкурировать с рабочими потоками
-    // TODO: sched_setaffinity для потока сэмплера
   }
 
   /// Останавливает сбор метрик.
   void stop() {
-    spdlog::debug("SystemSampler stop requested");
-    running_.store(false, std::memory_order_release);
+    const bool was_running =
+        running_.exchange(false, std::memory_order_acq_rel);
+    if (was_running) {
+      spdlog::debug("SystemSampler stop requested");
+    }
+
     if (thread_.joinable()) {
       thread_.join();
       spdlog::debug("SystemSampler stopped: samples_collected={}",
@@ -106,18 +109,26 @@ private:
                                                                 start_time_)
               .count());
 
-      read_cpu_utilization(s);
+      bool cpu_valid = read_cpu_utilization(s);
       read_memory_info(s);
       read_context_switches(s);
       read_page_faults(s);
       read_llc_misses(s);
 
-      samples_.push_back(s);
-      spdlog::debug(
-          "System sample: ts_us={}, cpu_total_pct={:.3f}, rss_bytes={}, "
-          "voluntary_cs={}, involuntary_cs={}, page_faults={}, llc_misses={}",
-          s.timestamp_us, s.cpu_total_pct, s.rss_bytes, s.voluntary_cs,
-          s.involuntary_cs, s.page_faults, s.llc_misses);
+      if (cpu_valid) {
+        samples_.push_back(s);
+        spdlog::debug(
+            "System sample: ts_us={}, cpu_total_pct={:.3f}, rss_bytes={}, "
+            "voluntary_cs={}, involuntary_cs={}, page_faults={}, llc_misses={}",
+            s.timestamp_us, s.cpu_total_pct, s.rss_bytes, s.voluntary_cs,
+            s.involuntary_cs, s.page_faults, s.llc_misses);
+      } else {
+        spdlog::debug(
+            "System sample skipped (baseline only): ts_us={}, rss_bytes={}, "
+            "voluntary_cs={}, involuntary_cs={}, page_faults={}, llc_misses={}",
+            s.timestamp_us, s.rss_bytes, s.voluntary_cs, s.involuntary_cs,
+            s.page_faults, s.llc_misses);
+      }
 
       std::this_thread::sleep_for(
           std::chrono::milliseconds(sampling_interval_ms_));
@@ -126,21 +137,20 @@ private:
   }
 
   /// Читает /proc/stat для CPU utilization.
-  void read_cpu_utilization(SystemSample &s) {
+  bool read_cpu_utilization(SystemSample &s) {
     std::ifstream f("/proc/stat");
     if (!f.is_open()) {
       spdlog::debug("Failed to open /proc/stat");
-      return;
+      return false;
     }
 
     std::string line;
-    std::getline(f, line); // первая строка: "cpu ..."
+    std::getline(f, line);
 
-    // Парсим: cpu user nice system idle iowait irq softirq steal guest
-    // guest_nice
     std::istringstream iss(line);
     std::string cpu_label;
-    uint64_t user, nice, system, idle, iowait, irq, softirq, steal;
+    uint64_t user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0,
+             softirq = 0, steal = 0;
     iss >> cpu_label >> user >> nice >> system >> idle >> iowait >> irq >>
         softirq >> steal;
 
@@ -148,20 +158,33 @@ private:
         user + nice + system + idle + iowait + irq + softirq + steal;
     uint64_t idle_total = idle + iowait;
 
-    if (prev_total_jiffies_ > 0) {
-      uint64_t d_total = total - prev_total_jiffies_;
-      uint64_t d_idle = idle_total - prev_idle_jiffies_;
-      if (d_total > 0) {
-        s.cpu_total_pct = 100.0 * (1.0 - static_cast<double>(d_idle) / d_total);
-      }
-    }
+    const uint64_t prev_total = prev_total_jiffies_;
+    const uint64_t prev_idle = prev_idle_jiffies_;
 
     prev_total_jiffies_ = total;
     prev_idle_jiffies_ = idle_total;
+
+    if (prev_total == 0) {
+      spdlog::debug(
+          "CPU util baseline established: total_jiffies={}, idle_jiffies={}",
+          total, idle_total);
+      return false;
+    }
+
+    uint64_t d_total = total - prev_total;
+    uint64_t d_idle = idle_total - prev_idle;
+
+    if (d_total > 0) {
+      s.cpu_total_pct = 100.0 * (1.0 - static_cast<double>(d_idle) / d_total);
+    } else {
+      s.cpu_total_pct = 0.0;
+    }
+
     spdlog::debug("CPU util sample: total_jiffies={}, idle_jiffies={}, "
                   "prev_total={}, prev_idle={}, cpu_total_pct={:.3f}",
-                  total, idle_total, prev_total_jiffies_, prev_idle_jiffies_,
-                  s.cpu_total_pct);
+                  total, idle_total, prev_total, prev_idle, s.cpu_total_pct);
+
+    return true;
   }
 
   /// Читает RSS из /proc/self/status.
