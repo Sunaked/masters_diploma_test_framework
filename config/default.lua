@@ -28,13 +28,13 @@ global = {
 threads_list = { 1, 4 }
 
 containers = {
-	-- {
-	-- 	name = "MyOwnContainer",
-	-- 	type = "custom",
-	-- 	target_time_minutes = 5,
-	-- },
-	-- NullContainer for overhead measurement
-	-- Uncomment to measure pure harness overhead:
+	{
+		name = "MyOwnContainer",
+		type = "custom",
+		target_time_minutes = 5,
+	},
+
+	-- NullContainer for overhead measurement:
 	{
 		name = "NullBaseline",
 		type = "null",
